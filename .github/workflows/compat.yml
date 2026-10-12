@@ -36,12 +36,12 @@ jobs:
         id: try
         run: |
           set -uo pipefail
-          if python3 scripts/patch_clavis_ai_card.py --target up --dry-run >/tmp/drift.txt 2>&1; then
+          if python3 scripts/patch_clavis_kit.py --target up --dry-run >/tmp/drift.txt 2>&1; then
             echo "ok=1" >> "$GITHUB_OUTPUT"
           else
             echo "ok=0" >> "$GITHUB_OUTPUT"
           fi
-          python3 scripts/patch_clavis_ai_card.py --target up --explain-drift --json >/tmp/drift.json 2>&1 || true
+          python3 scripts/patch_clavis_kit.py --target up --explain-drift --json >/tmp/drift.json 2>&1 || true
 
       - name: 漂移 → 开 issue
         if: steps.try.outputs.ok != '1'

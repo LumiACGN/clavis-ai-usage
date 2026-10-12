@@ -46,7 +46,46 @@ clavis-ai-usage --force   | jq .stale_sources   # 强制刷新，看哪些源是
 
 补丁器报「anchor matched 0 times」= Clavis 改了上游文本，按
 [`patches/README.md`](../patches/README.md) 的流程修锚点。你的桌面不受影响——
-sync 失败会自动恢复旧 overlay，继续跑旧版。
+sync 失败会自动恢复旧 overlay，继续跑旧版。若失败原因是「某组件的仓库文件缺失」，
+见下面的[多组件](#多组件多-kit)一节。
+
+## 多组件（多 kit）
+
+引擎 v2 允许同机注册多个 clavis 组件：它们共享同一个 overlay
+（`~/.config/quickshell/clavis/`），每次 sync 都**按 order 重放全部已注册组件**
+（先全量镜像、再逐 kit 重新打补丁）。所以「两个 clavis 组件互相覆盖 overlay」不再是问题
+——谁 sync 谁负责把大家都重新打上。`./install.sh --list` 看已注册组件与顺序。
+
+### 某个组件的仓库被删了 / 搬走了
+
+sync 会**响亮失败**（这是设计：宁可停下也不静默丢掉一个组件）：
+
+```
+ERROR: 以下已注册组件的仓库文件缺失（repo 被删/搬走？）：
+  - <kit-id>: 仓库目录不存在：/…/<kit-id>
+```
+
+按提示四选一：
+
+1. 把仓库移回原路径；
+2. 或到**新位置重跑 `./install.sh`**——同 kit id 会自动重绑 `repo_root` 后重新对齐；
+3. 或 `python3 scripts/clavis_overlay.py forget <kit-id>` 把它从注册表摘除（**不碰 overlay**；
+   它留在 overlay 里的补丁会变成"孤儿标记"，下次 sync 镜像时被清掉，见下）；
+4. 应急：本次加 `--skip-missing` 跳过它（注意：overlay 里它的补丁会被清掉，
+   桌面回到不含该组件的状态）。
+
+### 孤儿标记（verify 报「不属于任何已注册组件」）
+
+`verify` 末尾会报告 overlay 里存在、但不属于任何已注册组件的 `BEGIN clavis-*` 标记
+——多半是你手工改过 overlay，或某个组件被 `forget` 后残留。不想要就手工从对应文件里删掉，
+或者直接 `./install.sh --sync`（全量镜像会把 overlay 重置回干净状态；若那些文件同时
+也被某个 kit 记录在摘要里，sync 会先要求 `--force`）。
+
+### sync 要求 --force 是什么意思
+
+只有**无法归因的差异**才会拦你：overlay 文件与上次成功同步的摘要对不上、又不是兄弟 kit
+的补丁改写的——那很可能意味着你自己手改过 overlay。`--force` 只覆盖这一类差异（覆盖前
+仍会整体备份、也不跳过语法门禁）；被其它组件补丁改写的共享文件不会触发 `--force`。
 
 ## 外壳起不来（进入 failed 状态）
 
@@ -74,4 +113,6 @@ rm -rf ~/.cache/clavis-ai-usage       # 清缓存（历史数据与 last-good �
 若你以前用"直接改 /etc"的方式装过同类补丁，overlay 生效后那些改动会被遮蔽、
 而且每次 Clavis 升级后它们会静默失效（不报错但无效）。建议把对 Clavis 树的定制
 统一改到 overlay 上（即 `~/.config/quickshell/clavis/`），或卸载时用
-`./install.sh --uninstall --restore-etc` 清理锚点文件。
+`./install.sh --uninstall --restore-etc` 从
+`~/.local/state/clavis-overlay/backups/<kit>/etc-anchors-*.tar.gz` 的锚点备份还原
+（没有该备份时会报错退出）。

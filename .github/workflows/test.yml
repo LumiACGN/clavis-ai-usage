@@ -32,3 +32,6 @@ jobs:
 
       - name: overlay 彩排（假 HOME + 假树，端到端）
         run: tests/test_overlay.sh
+
+      - name: 多组件共存彩排（双 kit，假 HOME）
+        run: tests/test_coexist.sh

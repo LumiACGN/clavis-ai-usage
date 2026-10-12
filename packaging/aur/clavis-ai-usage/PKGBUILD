@@ -29,7 +29,7 @@ package() {
     # 数据树：引擎按脚本位置定位仓库根（scripts/../ = 本目录）
     install -Dm755 bin/clavis-ai-usage "$pkgdir/usr/lib/clavis-ai-usage/bin/clavis-ai-usage"
     install -Dm755 scripts/clavis_overlay.py "$pkgdir/usr/lib/clavis-ai-usage/scripts/clavis_overlay.py"
-    install -Dm755 scripts/patch_clavis_ai_card.py "$pkgdir/usr/lib/clavis-ai-usage/scripts/patch_clavis_ai_card.py"
+    install -Dm755 scripts/patch_clavis_kit.py "$pkgdir/usr/lib/clavis-ai-usage/scripts/patch_clavis_kit.py"
     install -Dm644 patches/manifest.json "$pkgdir/usr/lib/clavis-ai-usage/patches/manifest.json"
     install -Dm644 patches/README.md "$pkgdir/usr/lib/clavis-ai-usage/patches/README.md"
     for f in qml/*; do

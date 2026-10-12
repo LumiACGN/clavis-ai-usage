@@ -11,7 +11,7 @@ body:
         感谢反馈！请先运行下面的命令并把输出贴进来（它只打印新版上游的**公开代码文本**，
         不含任何凭据）：
         ```bash
-        python3 scripts/patch_clavis_ai_card.py --explain-drift \
+        python3 scripts/patch_clavis_kit.py --explain-drift \
             --manifest patches/manifest.json --target <你的 Clavis 源码树> --json
         ```
   - type: input

@@ -43,12 +43,18 @@ cd clavis-ai-usage
 安装采用 **overlay** 方式：把 `Clavis 源码树` 镜像到 `~/.config/quickshell/clavis/` 再叠加补丁，
 **不触碰 `/etc`**（那是包管理器的地盘，升级会被覆盖）。
 
-Clavis 升级后：
+同机的多个 clavis 组件共享这一个 overlay：引擎按各组件声明的 `order` 重放**全部**已注册组件
+——谁 `--sync` 谁负责把大家都重新打上，不会互相覆盖。详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+安装后（Clavis 升级 / 日常维护）：
 
 ```bash
 ./install.sh --sync      # 重新对齐（失败会保留旧 overlay 并恢复运行，不会炸）
 ./install.sh --verify    # 随时检查：overlay 是否陈旧 / 文件是否被改动
-./install.sh --uninstall # 卸载（默认保留你的配置与缓存）
+./install.sh --list      # 列出已注册组件（多组件共存时看谁在、重放顺序如何）
+./install.sh --uninstall # 只卸载本组件（默认保留你的配置与缓存）
+./install.sh --uninstall --all     # 整体拆除：所有组件 + overlay 一起移除
+./install.sh --forget <kit-id>     # 从注册表摘除某组件（不碰 overlay；仓库被删/搬走时的逃生舱）
 ```
 
 > ⚠️ Clavis 尚无插件系统，本组件通过"锚点补丁"接入，Clavis 大版本升级后锚点可能漂移

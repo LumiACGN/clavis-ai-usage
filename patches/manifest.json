@@ -1,6 +1,24 @@
 {
   "schema": 1,
   "tool_version": "0.1.0",
+  "kit": {
+    "id": "clavis-ai-usage",
+    "name": "AI 用量",
+    "order": 10,
+    "bin_name": "clavis-ai-usage",
+    "config_dir": "clavis-ai-usage",
+    "cache_dir": "clavis-ai-usage",
+    "legacy_config": "clavis/ai-usage.json",
+    "post_install_notes": [
+      "首次使用请在 ~/.config/clavis-ai-usage/config.json 填入 API key（没有 key 也能跑，只是看不到对应数据；模板见 docs/CONFIGURATION.md）",
+      "侧边栏第 4 页「AI 用量」/ 顶栏 AI 按钮即可查看",
+      "Clavis 升级后运行：./install.sh --sync"
+    ]
+  },
+  "gates": {
+    "overrides": {},
+    "smoke": null
+  },
   "upstream": {
     "name": "clavis-shell",
     "version": "2026.9.25",

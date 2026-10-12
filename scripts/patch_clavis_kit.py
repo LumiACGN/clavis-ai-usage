@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 LumiACGN
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""把「AI 用量」看板接入 Clavis shell 树（manifest 驱动的幂等锚点补丁器）。
+"""把 clavis 组件接入 Clavis shell 树（manifest 驱动的幂等锚点补丁器）。
 
 设计说明：
-  * 所有锚点/替换文本/载荷映射都在 patches/manifest.json —— 本脚本只是通用引擎。
-    Clavis 升级导致锚点漂移时，只需按 --explain-drift 的指引更新 manifest。
-  * 每个文件仅在「无任何标记」时打补丁；已打过补丁的文件会校验并跳过（幂等，
-    clavis-shell 每次升级后重跑即可）。
-  * 锚点必须精确命中一次；任一锚点不命中立即整体失败（写入前先全量校验），
-    绝不产生半打补丁的文件。
+  * 所有锚点/替换文本/载荷映射都在 patches/manifest.json —— 本脚本只是通用引擎
+    （kit 无关；同一份脚本在 clavis-ai-usage 与 clavis-lunar-calendar 两仓逐字节相同）。
+  * 两种定位模式：
+      - exact：整段 anchor 必须精确命中一次（最严；短行与希望被上游改动惊动的长块用它）
+      - block：结构块定位（unique_line 唯一命中 → 向上找开括号行 → 朴素花括号配对
+        → sanity 子串校验）。对上游「外观类改动」（例如全局字号 +1px 改了块内
+        font.pixelSize）鲁棒——只要块结构在，锚点漂移不再直接击穿补丁。
+        硬约束：block edit 的 replace 里 BEGIN/END 标记必须落在所定位组件的花括号内，
+        否则回滚会残留标记（原因见 patches/README.md；test_manifest.py 会强制检查）。
+  * 每个文件仅在「无任何标记」时打补丁；已打过补丁的文件会校验并跳过（幂等）。
+  * 写入前先对全树做预校验（exact 唯一命中 / block 可定位且 sanity 通过），绝不半打。
+  * 同一文件内的多个 edit 以「按文件位置升序、互不重叠」为契约（机器断言，
+    manifest 登记顺序即文件顺序），按 span 降序拼接；exact 模式与 v0.1.0 行为逐字节等价。
 
 用法:
-    patch_clavis_ai_card.py [--manifest patches/manifest.json] [--target TREE]
-                            [--payload qml/] [--dry-run] [--verify]
-                            [--revert [--remove-payload]]
-                            [--explain-drift [--json]]
-                            [--expect-upstream VERSION]
-                            [--group SLUG]... [--list-groups]
+    patch_clavis_kit.py [--manifest patches/manifest.json] [--target TREE]
+                        [--payload qml/] [--dry-run] [--verify]
+                        [--revert [--remove-payload]]
+                        [--explain-drift [--json]]
+                        [--expect-upstream VERSION]
+                        [--group SLUG]... [--list-groups] [--list-edits]
 """
 import argparse
 import difflib
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -31,6 +39,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "patches" / "manifest.json"
 DEFAULT_PAYLOAD = REPO_ROOT / "qml"
+PROG = Path(sys.argv[0]).name or "patch_clavis_kit.py"
+
+MODES = ("exact", "block")
+
+
+class BlockError(Exception):
+    """block 模式定位失败（explain_drift 需要捕获并转成报告，而不是直接退出）。"""
 
 
 def sha256(text: str) -> str:
@@ -52,6 +67,28 @@ def load_manifest(path: Path) -> dict:
     for key in ("upstream", "marker", "files", "payload"):
         if key not in manifest:
             fail(f"manifest missing required key: {key}")
+    kit = manifest.get("kit")
+    if kit is not None:
+        if not isinstance(kit, dict) or not kit.get("id"):
+            fail("manifest kit section must be an object with a non-empty 'id'")
+        order = kit.get("order", 50)
+        if not isinstance(order, int) or isinstance(order, bool):
+            fail(f"manifest kit.order must be an integer (got {order!r})")
+    for entry in manifest["files"]:
+        for edit in entry["edits"]:
+            mode = edit.get("mode", "exact")
+            if mode not in MODES:
+                fail(f"{entry['path']} / {edit.get('id')}: unknown edit mode {mode!r} "
+                     f"(expected one of {MODES})")
+            if mode == "block":
+                block = edit.get("block")
+                if not isinstance(block, dict) or not block.get("unique_line"):
+                    fail(f"{entry['path']} / {edit.get('id')}: block edit requires "
+                         "block.unique_line")
+                lookback = block.get("opener_lookback", 8)
+                if not isinstance(lookback, int) or isinstance(lookback, bool) or lookback < 1:
+                    fail(f"{entry['path']} / {edit.get('id')}: block.opener_lookback must be "
+                         f"a positive integer (got {lookback!r})")
     return manifest
 
 
@@ -75,19 +112,132 @@ def atomic_write(path: Path, text: str):
         raise
 
 
-def anchor_miss_error(path: Path, edit: dict, count: int, upstream_sha: str | None):
+def anchor_miss_error(path: Path, edit: dict, count: int, upstream_sha: str | None,
+                      phase: str = "apply"):
     head = edit["anchor"].splitlines()[0][:70]
     lines = [f"{path}: edit {edit['id']} anchor matched {count} times (expected 1): {head!r}"]
     lines.append(f"  anchor sha256:        {edit.get('anchor_sha256', '<unknown>')}")
-    current = sha256(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    if re.search(r"^\s*(?://|#|/\*)\s*BEGIN\s+clavis-", text, re.M):
+        lines.append("  注：该文件已含 clavis-* 补丁标记——源树可能被手工/旧流程打过补丁。"
+                     "正规做法是让对应组件注册后由 overlay 引擎重放（见 README / TROUBLESHOOTING）")
+    current = sha256(text)
     lines.append(f"  current file sha256:  {current}")
     if upstream_sha:
         note = "（与已知上游版本一致——这不该发生，请提交 issue）" if current == upstream_sha \
             else "（与已知上游版本不同——上游文本很可能已变化）"
         lines.append(f"  known upstream sha256: {upstream_sha} {note}")
-    lines.append("  -> 运行: patch_clavis_ai_card.py --explain-drift --manifest <manifest> --target <tree>"
+    lines.append(f"  -> 运行: {PROG} --explain-drift --manifest <manifest> --target <tree>"
                  "  查看新版上游的实际文本，然后更新 manifest（见 patches/README.md）")
     return "\n".join(lines)
+
+
+def _brace_end(text: str, open_idx: int, path) -> int:
+    depth = 0
+    for i in range(open_idx, len(text)):
+        char = text[i]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    raise BlockError(f"{path}: block 花括号不平衡——从 '{{' 起找不到配对的 '}}'")
+
+
+def _indent(line: str) -> str:
+    return line[:len(line) - len(line.lstrip())]
+
+
+def extract_block(text: str, path, unique_line: str, sanity, lookback: int = 8,
+                  anchor: str | None = None) -> tuple[int, int]:
+    """结构块定位：unique_line 唯一命中 → 向上找开括号行（≤ lookback）→ 花括号配对。
+
+    三道强化（相对 rice-work 参考实现）：
+      ① 提取结果的末行 strip 后必须以 '}' 结尾（字符串/注释里的花括号导致截断时报警）；
+      ② 末行缩进必须与 manifest anchor 的末行一致（花括号错配导致过度提取时报警）；
+      ③ 报错文案区分四种失败原因（unique_line 命中数 / 找不到开括号行 / 不平衡 / sanity 缺失）。
+    """
+    count = text.count(unique_line)
+    if count != 1:
+        raise BlockError(f"{path}: block unique_line 命中 {count} 次（期望 1）："
+                         f"{unique_line.strip()!r}——上游可能改写了此处，请看 --explain-drift")
+    idx = text.index(unique_line)
+    line_start = text.rfind("\n", 0, idx) + 1
+
+    opener_start = None
+    if text[line_start:text.index("\n", line_start)].rstrip().endswith("{"):
+        opener_start = line_start
+    else:
+        cursor = line_start
+        for _ in range(lookback):
+            if cursor == 0:
+                break
+            start = text.rfind("\n", 0, cursor - 1) + 1
+            if text[start:cursor].rstrip().endswith("{"):
+                opener_start = start
+                break
+            cursor = start
+    if opener_start is None:
+        raise BlockError(f"{path}: block 定位失败——unique_line 之上 {lookback} 行内找不到以 "
+                         f"'{{' 结尾的开括号行（unique_line: {unique_line.strip()!r}；"
+                         "必要时用 block.opener_lookback 调整）")
+
+    block_end = _brace_end(text, text.index("{", opener_start), path)
+    block = text[opener_start:block_end]
+    lines = block.splitlines()
+    if not lines or not lines[-1].strip().endswith("}"):
+        raise BlockError(f"{path}: 提取到的块末行不是 '}}'（疑似字符串/注释里的花括号错配）："
+                         f"{lines[-1][:60]!r}" if lines else f"{path}: 提取到的块为空")
+    if anchor:
+        anchor_last = anchor.rstrip().splitlines()[-1]
+        if _indent(lines[-1]) != _indent(anchor_last):
+            raise BlockError(f"{path}: 块结束行缩进与 manifest anchor 不一致——疑似花括号错配导致"
+                             f"过度提取（块末 {lines[-1]!r} vs anchor 末 {anchor_last!r}）")
+    for needle in sanity or []:
+        if needle not in block:
+            raise BlockError(f"{path}: 提取到的块缺少 sanity 子串 {needle!r}——拒绝猜测")
+    return opener_start, block_end
+
+
+def locate_span(text: str, edit: dict, path: Path, phase: str) -> tuple[int, int]:
+    """统一 span 出口。phase: apply | revert。"""
+    mode = edit.get("mode", "exact")
+    if mode == "exact":
+        target = edit["anchor"] if phase == "apply" else edit["replace"]
+        count = text.count(target)
+        if count != 1:
+            if phase == "apply":
+                fail(anchor_miss_error(path, edit, count, None))
+            fail(f"{path}: cannot revert edit {edit['id']}: replacement text not found exactly "
+                 "once — file was modified after patching")
+        start = text.index(target)
+        return start, start + len(target)
+
+    block = edit.get("block") or {}
+    unique_line = block.get("unique_line", "")
+    sanity = block.get("sanity") or []
+    if phase == "revert":
+        if block.get("unique_line_post"):
+            unique_line = block["unique_line_post"]
+        sanity = block.get("sanity_post") or sanity
+    lookback = int(block.get("opener_lookback", 8))
+    try:
+        return extract_block(text, path, unique_line, sanity, lookback,
+                             anchor=edit.get("anchor"))
+    except BlockError as exc:
+        fail(str(exc))
+
+
+def assert_spans(path: Path, spans: list):
+    """契约断言：同文件内的 edit 必须按文件位置升序登记、互不重叠（block 回滚依赖它）。"""
+    prev_end = -1
+    prev_id = None
+    for start, stop, _payload, edit in spans:
+        if start < prev_end:
+            fail(f"{path}: edit {edit['id']} 与 {prev_id} 在文件中重叠/未按文件位置升序登记"
+                 "——manifest 的 edits 必须按文件位置升序排列且互不重叠")
+        prev_end, prev_id = stop, edit["id"]
 
 
 def patch_file(path: Path, entry: dict, begin: str, end: str,
@@ -108,15 +258,20 @@ def patch_file(path: Path, entry: dict, begin: str, end: str,
         results.append({"path": str(path), "status": "missing"})
         return
 
-    # 先全量校验（写任何字节之前）
+    # 先全量定位（写任何字节之前），并做契约断言
+    spans = []
     for edit in edits:
-        count = text.count(edit["anchor"])
-        if count != 1:
-            fail(anchor_miss_error(path, edit, count, entry.get("upstream_sha256")))
+        if edit.get("mode", "exact") == "block":
+            replacement = edit["replace"]
+            if replacement.count(begin) != 1 or replacement.count(end) != 1:
+                fail(f"{path}: edit {edit['id']}: block 模式的 replace 必须各含 1 个 BEGIN/END 标记")
+        span = locate_span(text, edit, path, "apply")
+        spans.append((*span, edit["replace"], edit))
+    assert_spans(path, spans)
 
     original = text
-    for edit in edits:
-        text = text.replace(edit["anchor"], edit["replace"])
+    for start, stop, replacement, _edit in sorted(spans, key=lambda s: s[0], reverse=True):
+        text = text[:start] + replacement + text[stop:]
 
     if dry_run:
         print(f"--- would patch: {path}")
@@ -142,14 +297,18 @@ def revert_file(path: Path, entry: dict, begin: str, end: str,
         fail(f"{path}: marker count mismatch (BEGIN={begin_count}, END={end_count}, "
              f"expected={len(edits)}) — refusing to revert a partially patched file")
 
+    spans = []
     for edit in edits:
-        if text.count(edit["replace"]) != 1:
-            fail(f"{path}: cannot revert edit {edit['id']}: replacement text not found exactly once "
-                 "— file was modified after patching")
+        span = locate_span(text, edit, path, "revert")
+        if begin not in text[span[0]:span[1]]:
+            fail(f"{path}: cannot revert edit {edit['id']}: 定位到的块不含本组 BEGIN 标记"
+                 "——拒绝回滚一个不是本工具打出的块")
+        spans.append((*span, edit["anchor"], edit))
+    assert_spans(path, spans)
 
     original = text
-    for edit in edits:
-        text = text.replace(edit["replace"], edit["anchor"])
+    for start, stop, replacement, _edit in sorted(spans, key=lambda s: s[0], reverse=True):
+        text = text[:start] + replacement + text[stop:]
 
     if dry_run:
         print(f"--- would revert: {path}")
@@ -231,21 +390,46 @@ def explain_drift(target: Path, manifest: dict, as_json: bool) -> int:
         if text.count(begin) == len(entry["edits"]):
             continue  # 已打过补丁，跳过
         for edit in entry["edits"]:
-            count = text.count(edit["anchor"])
-            if count == 1:
-                continue
-            anchor_lines = edit["anchor"].splitlines()
+            mode = edit.get("mode", "exact")
+            if mode == "exact":
+                count = text.count(edit["anchor"])
+                if count == 1:
+                    continue
+                probe_text = edit["anchor"]
+                detail = None
+            else:
+                block = edit.get("block") or {}
+                unique_line = block.get("unique_line", "")
+                count = text.count(unique_line)
+                if count == 1:
+                    # 直接调 extract_block（抛异常、不打印），保持 --json 的 stderr 干净
+                    try:
+                        extract_block(text, path, unique_line, block.get("sanity") or [],
+                                      int(block.get("opener_lookback", 8)),
+                                      anchor=edit.get("anchor"))
+                        continue
+                    except BlockError as exc:
+                        detail = str(exc)
+                        prefix = f"{path}: "
+                        if detail.startswith(prefix):
+                            detail = detail[len(prefix):]
+                else:
+                    detail = f"block unique_line 命中 {count} 次"
+                probe_text = unique_line
+            anchor_lines = probe_text.splitlines()
             ratio, start = best_match(anchor_lines, file_lines)
             lo = max(0, start - 3)
             hi = min(len(file_lines), start + len(anchor_lines) + 3)
             drift.append({
                 "file": entry["path"],
                 "edit": edit["id"],
+                "mode": mode,
                 "matched": count,
                 "anchor_sha256": edit.get("anchor_sha256"),
                 "best_match_ratio": round(ratio, 3),
                 "best_match_line": start + 1 if start >= 0 else None,
                 "context": "\n".join(file_lines[lo:hi]),
+                **({"detail": detail} if detail else {}),
             })
 
     if as_json:
@@ -255,8 +439,11 @@ def explain_drift(target: Path, manifest: dict, as_json: bool) -> int:
         if not drift:
             print("no drift: all anchors match")
         for item in drift:
-            print(f"\n=== {item['file']}  edit {item['edit']}  (matched {item['matched']} times) ===")
+            print(f"\n=== {item['file']}  edit {item['edit']}  [{item['mode']}]  "
+                  f"(matched {item['matched']} times) ===")
             print(f"  anchor sha256: {item['anchor_sha256']}")
+            if item.get("detail"):
+                print(f"  诊断: {item['detail']}")
             print(f"  最相似的窗口在第 {item['best_match_line']} 行（相似度 {item['best_match_ratio']}），"
                   "新版上游的实际文本如下（±3 行）：")
             for line in item["context"].splitlines():
@@ -284,6 +471,8 @@ def main():
                         help="期望的 Clavis 版本（不符仅告警；锚点匹配才是判据）")
     parser.add_argument("--group", action="append", default=None, help="只处理某组（可重复）")
     parser.add_argument("--list-groups", action="store_true", help="列出补丁组")
+    parser.add_argument("--list-edits", action="store_true",
+                        help="按文件位置列出 edit（id/mode/首行），用于校准 manifest 顺序")
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     args = parser.parse_args()
 
@@ -296,6 +485,16 @@ def main():
         for slug in groups:
             files = [e["path"] for e in manifest["files"] if e["group"] == slug]
             print(f"{slug}: {', '.join(files)}")
+        return
+
+    if args.list_edits:
+        for entry in manifest["files"]:
+            print(f"{entry['path']}  [{entry['group']}]")
+            for edit in entry["edits"]:
+                mode = edit.get("mode", "exact")
+                head = (edit.get("block") or {}).get("unique_line", "") if mode == "block" \
+                    else edit["anchor"].splitlines()[0]
+                print(f"  {edit['id']:<20} {mode:<6} {head.strip()[:70]!r}")
         return
 
     if not target.is_dir():
@@ -311,7 +510,7 @@ def main():
     selected = set(args.group) if args.group else set(groups)
     results: list = []
 
-    # 全树预校验：写任何字节之前，确保所有目标文件要么已打补丁、要么全部锚点可精确命中
+    # 全树预校验：写任何字节之前，确保所有目标文件要么已打补丁、要么全部 edit 可定位
     if not args.verify:
         for entry in manifest["files"]:
             if entry["group"] not in selected:
@@ -326,20 +525,14 @@ def main():
                 if bc != len(entry["edits"]) or ec != len(entry["edits"]):
                     fail(f"{path}: marker count mismatch (BEGIN={bc}, END={ec}, "
                          f"expected={len(entry['edits'])}) — refusing to revert a partially patched file")
-                for edit in entry["edits"]:
-                    if text.count(edit["replace"]) != 1:
-                        fail(f"{path}: cannot revert edit {edit['id']}: replacement text not found "
-                             "exactly once — file was modified after patching")
             else:
                 if bc or ec:
                     if bc != len(entry["edits"]) or ec != len(entry["edits"]):
                         fail(f"{path}: marker count mismatch (BEGIN={bc}, END={ec}, "
                              f"expected={len(entry['edits'])}) — refusing to guess a partially patched file")
                     continue
-                for edit in entry["edits"]:
-                    count = text.count(edit["anchor"])
-                    if count != 1:
-                        fail(anchor_miss_error(path, edit, count, entry.get("upstream_sha256")))
+            for edit in entry["edits"]:
+                locate_span(text, edit, path, "revert" if args.revert else "apply")
 
     for entry in manifest["files"]:
         if entry["group"] not in selected:
