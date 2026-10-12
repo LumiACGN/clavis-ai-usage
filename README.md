@@ -34,7 +34,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/<owner>/clavis-ai-usage.git
+git clone https://github.com/LumiACGN/clavis-ai-usage.git
 cd clavis-ai-usage
 ./install.sh --dry-run   # 先看会发生什么（不写任何文件、不停 shell）
 ./install.sh             # 正式安装（自动停/起 clavis-shell）
