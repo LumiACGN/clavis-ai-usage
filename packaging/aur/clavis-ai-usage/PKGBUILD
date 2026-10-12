@@ -23,7 +23,7 @@ install="$pkgname.install"
 # 不用 GitHub 自动归档——它的校验和与 release 资产不同，且长期稳定性无保证）。
 # 发版后回填：取 Release 页 SHA256SUMS 里 $pkgname-$pkgver.tar.gz 那一行。
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('642c0a43602db3a1f9f300d1c8ba4a667cb7eab57786c49262570da66a86d80d')
 
 package() {
     cd "$pkgname-$pkgver"

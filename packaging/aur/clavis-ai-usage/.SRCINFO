@@ -15,6 +15,6 @@ pkgbase = clavis-ai-usage
 	optdepends = rsync: overlay 同步更快
 	optdepends = clavis-shell: 目标外壳（由上游安装器提供，不在官方仓库）
 	source = clavis-ai-usage-0.1.1.tar.gz::https://github.com/LumiACGN/clavis-ai-usage/releases/download/v0.1.1/clavis-ai-usage-0.1.1.tar.gz
-	sha256sums = SKIP
+	sha256sums = 642c0a43602db3a1f9f300d1c8ba4a667cb7eab57786c49262570da66a86d80d
 
 pkgname = clavis-ai-usage
