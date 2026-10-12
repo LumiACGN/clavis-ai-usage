@@ -18,7 +18,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 HOME_DIR="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
 if [ -z "$HOME_DIR" ]; then

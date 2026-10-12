@@ -1,6 +1,6 @@
 pkgbase = clavis-ai-usage
 	pkgdesc = Clavis Shell（niri + Quickshell）侧边栏的 AI 用量看板（overlay 安装，不触碰 /etc）
-	pkgver = 0.1.0
+	pkgver = 0.1.1
 	pkgrel = 1
 	url = https://github.com/LumiACGN/clavis-ai-usage
 	install = clavis-ai-usage.install
@@ -14,7 +14,7 @@ pkgbase = clavis-ai-usage
 	optdepends = ccusage: Claude Code 本地用量数据源（npm i -g ccusage）
 	optdepends = rsync: overlay 同步更快
 	optdepends = clavis-shell: 目标外壳（由上游安装器提供，不在官方仓库）
-	source = clavis-ai-usage-0.1.0.tar.gz::https://github.com/LumiACGN/clavis-ai-usage/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = 703e3d573ba96d814e727a051d092aad9c6969bd94d19225c9ac3b3b03bd3134
+	source = clavis-ai-usage-0.1.1.tar.gz::https://github.com/LumiACGN/clavis-ai-usage/releases/download/v0.1.1/clavis-ai-usage-0.1.1.tar.gz
+	sha256sums = SKIP
 
 pkgname = clavis-ai-usage

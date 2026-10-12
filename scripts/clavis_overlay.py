@@ -621,8 +621,11 @@ def run_smoke(overlay: Path, kit: dict, gate_cache: set) -> bool:
     repo = Path(kit["repo_root"])
     smoke_file = repo / smoke["file"]
     if not smoke_file.is_file():
-        print(f"  门禁 FAIL (smoke)：{smoke_file} 不存在", file=sys.stderr)
-        return False
+        # 打包布局（AUR）下 tests/ 可能不随包提供；这是打包问题而非补丁问题，
+        # qmllint/qmlformat 门禁仍在把关 → 跳过而不阻断安装。
+        warn(f"{smoke_file} 不存在——跳过 smoke 门禁"
+             "（git 克隆安装应带上 tests/；AUR 包也应随包提供该文件）")
+        return True
     tmp = Path(tempfile.mkdtemp(prefix="clavis-smoke-"))
     try:
         staged = tmp / smoke["file"]

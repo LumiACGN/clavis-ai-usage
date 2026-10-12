@@ -5,7 +5,7 @@
 # 提交 AUR 前请：makepkg --printsrcinfo > .SRCINFO，并把 sha256sums 换成
 # release CI 产出的真实校验和（仓库 Release 页的 SHA256SUMS）。
 pkgname=clavis-ai-usage
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Clavis Shell（niri + Quickshell）侧边栏的 AI 用量看板（overlay 安装，不触碰 /etc）"
 arch=('any')
@@ -19,9 +19,11 @@ optdepends=(
     'clavis-shell: 目标外壳（由上游安装器提供，不在官方仓库）'
 )
 install="$pkgname.install"
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# v0.1.0 的 GitHub 自动归档（archive/refs/tags/v0.1.0.tar.gz）校验和
-sha256sums=('703e3d573ba96d814e727a051d092aad9c6969bd94d19225c9ac3b3b03bd3134')
+# 指向 release CI 产出的 git archive 资产（与 Release 页的 SHA256SUMS 自洽；
+# 不用 GitHub 自动归档——它的校验和与 release 资产不同，且长期稳定性无保证）。
+# 发版后回填：取 Release 页 SHA256SUMS 里 $pkgname-$pkgver.tar.gz 那一行。
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
 
 package() {
     cd "$pkgname-$pkgver"
