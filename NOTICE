@@ -1,0 +1,17 @@
+本仓库包含与衍生的第三方组件：
+
+1. Clavis Shell（github.com/StatIndet/quickshell）
+   本项目的 QML 补丁与新增模块基于 Clavis 的源码结构开发，补丁内容中包含其经修改的
+   代码片段；本项目是其衍生作品。
+   许可证：GPL-3.0-or-later
+   → 因此本仓库整体以 GPL-3.0-or-later 发布（见 LICENSE）。
+
+2. Simple Icons（github.com/simple-icons/simple-icons）
+   qml/claude-logo.svg、qml/deepseek-logo.svg 来源于该图标集。
+   许可证：CC0-1.0
+   商标声明：“Claude”“DeepSeek”及其标志为各自权利人的商标；本项目与 Anthropic、
+   DeepSeek 均无关联，图标仅用于标识对应服务。若权利人提出要求，将替换为中性图标。
+
+3. ai-usagebar（github.com/akitaonrails/ai-usagebar）
+   本项目在运行时调用该工具获取供应商数据，**不包含**其代码。
+   许可证：MIT
