@@ -42,8 +42,9 @@
 
 说明 Clavis 改了上游文本，属预期内的维护工作。修复流程见
 [`patches/README.md`](../patches/README.md)（含 `--explain-drift` 诊断工具与
-"如何为新版本重新校准"分步说明）。仓库里还有一个每周跑的
-[compat-watch 工作流](../.github/workflows/compat.yml) 会提前开 issue 预警。
+"如何为新版本重新校准"分步说明）。仓库里还有
+[compat-watch 工作流](../.github/workflows/compat.yml)：**手动触发**（Actions 页 →
+compat-watch → Run workflow），会检查上游最新版本、锚点漂移时自动开 issue 预警。
 
 ## 卸载与回退
 

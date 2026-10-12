@@ -1,14 +1,13 @@
 # SPDX-FileCopyrightText: 2026 LumiACGN
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# 每周瞄一眼 Clavis 上游的最新 release：
+# 检查 Clavis 上游的最新 release（**仅手动触发**：Actions 页 → compat-watch → Run workflow，
+# 或终端 gh workflow run compat-watch）：
 #   * 锚点漂移 → 自动开 issue（附补丁器的漂移报告）
 #   * 锚点仍匹配但版本更新 → 开一条“可更新基线”的提醒
 name: compat-watch
 
 on:
-  schedule:
-    - cron: "43 3 * * 1"    # 每周一 UTC 03:43（北京时间 11:43）
   workflow_dispatch:
 
 permissions:

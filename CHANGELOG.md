@@ -7,3 +7,4 @@
 ## [Unreleased]
 
 - 项目开源化整理中：overlay 安装器、锚点补丁器泛化、后端脚本硬化。
+- compat-watch 工作流改为**仅手动触发**（按需在 Actions 页运行）。
