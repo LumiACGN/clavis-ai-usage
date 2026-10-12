@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "tool_version": "0.1.0",
+  "upstream": {
+    "name": "clavis-shell",
+    "version": "2026.9.25",
+    "tree_hint": "/etc/xdg/quickshell/clavis"
+  },
+  "marker": {
+    "begin": "// BEGIN clavis-{group}",
+    "end": "// END clavis-{group}"
+  },
+  "files": [
+    {
+      "group": "ai-view",
+      "path": "Modules/Sidebars/Dashboard/DashboardSidebarContent.qml",
+      "upstream_sha256": "2c0e8313dac86ff8a38b6ceb399db9f8cf3d1437475763e57618dab76aa4f46e",
+      "edits": [
+        {
+          "id": "edit-1",
+          "anchor": "    readonly property var activeViewLoader: activeView === \"info\" ? infoLoader : activeView === \"drawer\"\n                                                                    ? drawerLoader : weatherLoader",
+          "replace": "    readonly property var activeViewLoader: {\n        switch (activeView) {\n        case \"drawer\":\n            return drawerLoader;\n        case \"weather\":\n            return weatherLoader;\n        // BEGIN clavis-ai-view\n        case \"ai\":\n            return aiLoader;\n        // END clavis-ai-view\n        default:\n            return infoLoader;\n        }\n    }",
+          "anchor_sha256": "89dadd948773f259663173d597c0a7a06fb05d8e3a31b90ec82112f35d85abeb"
+        },
+        {
+          "id": "edit-2",
+          "anchor": "    readonly property int instantiatedViewCount: {\n        return (infoLoader.item ? 1 : 0) + (drawerLoader.item ? 1 : 0) + (weatherLoader.item ? 1 : 0);\n    }",
+          "replace": "    readonly property int instantiatedViewCount: {\n        // BEGIN clavis-ai-view\n        return (infoLoader.item ? 1 : 0) + (drawerLoader.item ? 1 : 0) + (weatherLoader.item ? 1 : 0) + (\n            aiLoader.item ? 1 : 0);\n        // END clavis-ai-view\n    }",
+          "anchor_sha256": "71285880405001bdbea9675a4a341d91beb9c7baf921189727b871ccd65e95eb"
+        },
+        {
+          "id": "edit-3",
+          "anchor": "                {\n                    id: \"weather\",\n                    icon: \"cloud\",\n                    label: qsTr(\"Weather\")\n                }\n            ]",
+          "replace": "                {\n                    id: \"weather\",\n                    icon: \"cloud\",\n                    label: qsTr(\"Weather\")\n                },\n                // BEGIN clavis-ai-view\n                {\n                    id: \"ai\",\n                    // Official Claude mark as an SVG asset; \"asterisk\" remains\n                    // the fallback glyph when the asset is unavailable.\n                    icon: \"asterisk\",\n                    logo: Qt.resolvedUrl(\"claude-logo.svg\"),\n                    // Literal Chinese: the .qm catalogs ship inside the Clavis\n                    // C++ plugin, so a new qsTr() key cannot have a zh_CN entry.\n                    label: \"AI 用量\"\n                }\n                // END clavis-ai-view\n            ]",
+          "anchor_sha256": "5e1223a0f573d25e594c7ddd96063fe0680ca3135770364ce2ab364c8e2e542c"
+        },
+        {
+          "id": "edit-4",
+          "anchor": "                            MaterialSymbol {\n                                anchors.verticalCenter: parent.verticalCenter\n                                text: tabButton.modelData.icon\n                                iconSize: 22\n                                fill: tabButton.active ? 1 : 0\n                                color: tabButton.active ? Appearance.colors.colOnSecondaryContainer :\n                                                          Appearance.colors.colOnSurfaceVariant\n                            }",
+          "replace": "                            // BEGIN clavis-ai-view\n                            Item {\n                                anchors.verticalCenter: parent.verticalCenter\n                                width: 22\n                                height: 22\n\n                                MaterialSymbol {\n                                    anchors.fill: parent\n                                    visible: !tabButton.modelData.logo\n                                    text: tabButton.modelData.icon\n                                    iconSize: 22\n                                    fill: tabButton.active ? 1 : 0\n                                    color: tabButton.active ? Appearance.colors.colOnSecondaryContainer :\n                                                              Appearance.colors.colOnSurfaceVariant\n                                }\n\n                                Image {\n                                    anchors.fill: parent\n                                    visible: !!tabButton.modelData.logo\n                                    source: tabButton.modelData.logo || \"\"\n                                    sourceSize.width: 44\n                                    sourceSize.height: 44\n                                    fillMode: Image.PreserveAspectFit\n                                }\n                            }\n                            // END clavis-ai-view",
+          "anchor_sha256": "463870a969b4625f940f031eaf7cb3bac2e98fbff1a727bfaaaf5cada31a9c58"
+        },
+        {
+          "id": "edit-5",
+          "anchor": "            Loader {\n                id: weatherLoader\n\n                property bool loadedOnce: false\n\n                anchors.fill: parent\n                active: root.activeView === \"weather\" || loadedOnce\n                visible: active && root.activeView === \"weather\"\n                asynchronous: true\n                sourceComponent: weatherComponent\n                onLoaded: loadedOnce = true\n            }",
+          "replace": "            Loader {\n                id: weatherLoader\n\n                property bool loadedOnce: false\n\n                anchors.fill: parent\n                active: root.activeView === \"weather\" || loadedOnce\n                visible: active && root.activeView === \"weather\"\n                asynchronous: true\n                sourceComponent: weatherComponent\n                onLoaded: loadedOnce = true\n            }\n\n            // BEGIN clavis-ai-view\n            Loader {\n                id: aiLoader\n\n                property bool loadedOnce: false\n\n                anchors.fill: parent\n                active: root.activeView === \"ai\" || loadedOnce\n                visible: active && root.activeView === \"ai\"\n                asynchronous: true\n                sourceComponent: aiComponent\n                onLoaded: loadedOnce = true\n            }\n            // END clavis-ai-view",
+          "anchor_sha256": "b4eba7d9cdfbc76b0936f5dce7faf2a25f929f34477d867aa3970b58bc5b8807"
+        },
+        {
+          "id": "edit-6",
+          "anchor": "            Component {\n                id: weatherComponent\n\n                WeatherView {\n                    weatherSourceOverride: root.weatherSourceOverride\n                    foreground: root.foreground && root.activeView === \"weather\"\n                    presentationActive: root.presentationActive && root.activeView === \"weather\"\n                }\n            }",
+          "replace": "            Component {\n                id: weatherComponent\n\n                WeatherView {\n                    weatherSourceOverride: root.weatherSourceOverride\n                    foreground: root.foreground && root.activeView === \"weather\"\n                    presentationActive: root.presentationActive && root.activeView === \"weather\"\n                }\n            }\n\n            // BEGIN clavis-ai-view\n            Component {\n                id: aiComponent\n\n                AiView {\n                    foreground: root.foreground && root.activeView === \"ai\"\n                }\n            }\n            // END clavis-ai-view",
+          "anchor_sha256": "48124ec6fdaed682d73c236c8124771f1f3b6b9190d1005fc0e17debb7c2b306"
+        }
+      ]
+    },
+    {
+      "group": "ai-view",
+      "path": "Common/SidebarPolicy.js",
+      "upstream_sha256": "9fcae1065dcafec21a88353b1a95d98865d9abfc28739a1113af66af5c1cac01",
+      "edits": [
+        {
+          "id": "edit-1",
+          "anchor": "    if (target === \"dashboard\" || target === \"left\" || target === \"weather\" || target === \"drawer\")\n        return \"dashboard\";",
+          "replace": "    // BEGIN clavis-ai-view\n    if (target === \"dashboard\" || target === \"left\" || target === \"weather\" || target === \"drawer\"\n            || target === \"ai\")\n        return \"dashboard\";\n    // END clavis-ai-view",
+          "anchor_sha256": "ffc2c5188d4a7e99a85ad992d39a29bd96f9f9d9b22c22cd8c85a0ad77cbc152"
+        },
+        {
+          "id": "edit-2",
+          "anchor": "        return dashboard && ((requested !== \"weather\" && requested !== \"drawer\") || view === requested);",
+          "replace": "        // BEGIN clavis-ai-view\n        // \"weather\"/\"drawer\"/\"ai\" are view-scoped targets: they count as open\n        // only while their view is actually shown.\n        return dashboard && ([\"weather\", \"drawer\", \"ai\"].indexOf(requested) === -1 || view === requested);\n        // END clavis-ai-view",
+          "anchor_sha256": "d0d31c58324ec697807a9cf6c6036f83911a5d6f27f58917ef661fc1607b0fd5"
+        }
+      ]
+    },
+    {
+      "group": "ai-view",
+      "path": "Modules/Sidebars/SidebarHostWindow.qml",
+      "upstream_sha256": "2781b1e5bb22ad1c202e083f311af46db537086a2edb893436f10cff4281ee81",
+      "edits": [
+        {
+          "id": "edit-1",
+          "anchor": "        if (open && (requestedView === \"weather\" || requestedView === \"drawer\"))\n            WidgetState.dashboardSidebarView = requestedView;",
+          "replace": "        // BEGIN clavis-ai-view\n        if (open && (requestedView === \"weather\" || requestedView === \"drawer\" || requestedView === \"ai\"))\n            WidgetState.dashboardSidebarView = requestedView;\n        // END clavis-ai-view",
+          "anchor_sha256": "f8aaa936071bcd56f92453b792815629e6fa1651a8b460e08a9b0db591b9530c"
+        }
+      ]
+    },
+    {
+      "group": "ai-view",
+      "path": "Modules/Bar/ActiveWindow/SidebarButton.qml",
+      "upstream_sha256": "7052b8340b2e62ad98d0566c8005ae67431fea0f9db071b06ee4fe465c0b3e4b",
+      "edits": [
+        {
+          "id": "edit-1",
+          "anchor": "        columns: root.vertical ? 1 : 3",
+          "replace": "        // BEGIN clavis-ai-view\n        columns: root.vertical ? 1 : 4\n        // END clavis-ai-view",
+          "anchor_sha256": "85b2d1506b4e96c3d9cc7c943e9bc5cbc2c28444df63affa3fc94ad23a2819ec"
+        },
+        {
+          "id": "edit-2",
+          "anchor": "        SidebarWeatherButton {\n            vertical: root.vertical\n        }",
+          "replace": "        SidebarWeatherButton {\n            vertical: root.vertical\n        }\n\n        // BEGIN clavis-ai-view\n        SidebarAiButton {}\n        // END clavis-ai-view",
+          "anchor_sha256": "dc11f45996238fc3a1f2b0ca599caf57c9bcddb5846928ab7368bec06a436f22"
+        }
+      ]
+    }
+  ],
+  "payload": [
+    {
+      "src": "AiUsageService.qml",
+      "dest": "Services/AiUsageService.qml"
+    },
+    {
+      "src": "AiView.qml",
+      "dest": "Modules/Sidebars/Dashboard/AiView.qml"
+    },
+    {
+      "src": "AiUsageHistoryCard.qml",
+      "dest": "Modules/Sidebars/Dashboard/AiUsageHistoryCard.qml"
+    },
+    {
+      "src": "deepseek-logo.svg",
+      "dest": "Modules/Sidebars/Dashboard/deepseek-logo.svg"
+    },
+    {
+      "src": "claude-logo.svg",
+      "dest": "Modules/Sidebars/Dashboard/claude-logo.svg"
+    },
+    {
+      "src": "SidebarAiButton.qml",
+      "dest": "Modules/Bar/ActiveWindow/SidebarAiButton.qml"
+    }
+  ]
+}
