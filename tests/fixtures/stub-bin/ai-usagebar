@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 LumiACGN
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# 桩：模拟 `ai-usagebar usage --json` 的输出形状（**全合成数据**，用于截图预览与测试）。
+# 字段形状依据 bin/clavis-ai-usage 的归一化 jq：entries[].{id,display_name,plan,status,
+# stale,fetched_at,metrics[].{label,percent,severity,reset_at},sections[].{type,value}}。
+case "${1:-}" in
+    usage)
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        reset_short="$(( $(date +%s) + 13200 ))"
+        reset_long="$(( $(date +%s) + 208000 ))"
+        balance="${STUB_BALANCE:-18.36}"
+        cat <<EOF
+{"schema_version":1,"entries":[
+ {"id":"deepseek","display_name":"DeepSeek","status":"ready","fetched_at":"$now","metrics":[],
+  "sections":[{"type":"text","value":"¥$balance"}]},
+ {"id":"zai","display_name":"GLM Coding Plan","plan":"Pro","status":"ready","fetched_at":"$now",
+  "metrics":[{"label":"5h 窗口","percent":23.4,"severity":"ok","reset_at":$reset_short}],
+  "sections":[]},
+ {"id":"kimi","display_name":"Kimi","status":"ready","fetched_at":"$now",
+  "metrics":[{"label":"周配额","percent":41.2,"severity":"warn","reset_at":$reset_long}],
+  "sections":[]},
+ {"id":"openrouter","display_name":"OpenRouter","status":"ready","fetched_at":"$now",
+  "metrics":[{"label":"Credits","percent":17.9,"severity":"ok","reset_at":0}],
+  "sections":[]}
+]}
+EOF
+        ;;
+    *)
+        echo "stub ai-usagebar: unsupported: $*" >&2
+        exit 1
+        ;;
+esac

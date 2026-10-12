@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 LumiACGN
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# 桩：模拟 `ccusage daily --json` / `ccusage blocks --json`（**全合成数据**）。
+# 字段形状依据 bin/clavis-ai-usage 的 merge_history / fetch_local jq。
+set -euo pipefail
+
+case "${1:-}" in
+    daily)
+        printf '{"daily":['
+        first=1
+        for n in $(seq 45 -1 0); do
+            d="$(date -d "-$n days" +%F)"
+            tk=$(( 350000 + ( (n * 7919 + 131) % 1250000 ) ))
+            cr=$(( tk * 62 / 100 ))
+            inp=$(( tk * 19 / 100 ))
+            out=$(( tk * 9 / 100 ))
+            cw=$(( tk - cr - inp - out ))
+            cost="$(awk -v t="$tk" 'BEGIN{printf "%.4f", t/1000000*1.35}')"
+            [ "$first" = 1 ] || printf ','
+            printf '{"period":"%s","totalTokens":%d,"cacheReadTokens":%d,"inputTokens":%d,"outputTokens":%d,"cacheCreationTokens":%d,"totalCost":%s,"modelsUsed":["deepseek-flash"]}' \
+                "$d" "$tk" "$cr" "$inp" "$out" "$cw" "$cost"
+            first=0
+        done
+        printf ']}'
+        ;;
+    blocks)
+        printf '{"blocks":[{"isActive":true,"totalTokens":486000,"costUSD":0.92,"burnRate":{"costPerHour":0.31,"tokensPerMinute":2140},"projection":{"remainingMinutes":172,"totalTokens":1052400,"totalCost":1.77}}]}'
+        ;;
+    *)
+        echo "stub ccusage: unsupported: $*" >&2
+        exit 1
+        ;;
+esac
