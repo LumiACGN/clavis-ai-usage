@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: 2026 LumiACGN
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 校验 tag == manifest 版本 & CHANGELOG
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          ver=$(jq -r '.tool_version' patches/manifest.json)
+          [ "$tag" = "$ver" ] || { echo "tag($tag) != manifest tool_version($ver)"; exit 1; }
+          grep -q "\[$tag\]" CHANGELOG.md || { echo "CHANGELOG.md 缺少 [$tag] 小节"; exit 1; }
+
+      - name: 打包与校验和
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          git archive --prefix="clavis-ai-usage-$tag/" -o "clavis-ai-usage-$tag.tar.gz" HEAD
+          sha256sum "clavis-ai-usage-$tag.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            clavis-ai-usage-*.tar.gz
+            SHA256SUMS
+          generate_release_notes: true

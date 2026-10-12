@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 LumiACGN
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck jq
+
+      - name: shell 语法与 shellcheck
+        run: |
+          set -euo pipefail
+          mapfile -t shs < <(git ls-files '*.sh' 'bin/clavis-ai-usage')
+          bash -n "${shs[@]}"
+          shellcheck -S warning "${shs[@]}"
+
+      - name: Python 语法
+        run: |
+          python3 - <<'PY'
+          import ast, pathlib
+          for f in pathlib.Path('.').rglob('*.py'):
+              ast.parse(f.read_text(encoding='utf-8'), str(f))
+          print('python syntax ok')
+          PY
+
+      - name: manifest 自检
+        run: python3 tests/test_manifest.py
+
+      - name: JSON 可解析（示例配置等）
+        run: |
+          for f in $(git ls-files '*.json' 'config/*.example.*'); do
+            jq -e . "$f" >/dev/null || { echo "invalid JSON: $f"; exit 1; }
+          done
+
+      - name: 密钥扫描
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 注：QML 语法门禁（qmlformat/qmllint）需要 Clavis 组件上下文，只在用户机器上
+      # 由 overlay 引擎执行（scripts/clavis_overlay.py 的 run_gate），CI 里跳过。
