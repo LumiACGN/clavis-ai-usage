@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2026 LumiACGN
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Maintainer: LumiACGN <196269580+LumiACGN@users.noreply.github.com>
+#
+# 提交 AUR 前请：makepkg --printsrcinfo > .SRCINFO，并把 sha256sums 换成
+# release CI 产出的真实校验和（仓库 Release 页的 SHA256SUMS）。
+pkgname=clavis-ai-usage
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Clavis Shell（niri + Quickshell）侧边栏的 AI 用量看板（overlay 安装，不触碰 /etc）"
+arch=('any')
+url="https://github.com/LumiACGN/clavis-ai-usage"
+license=('GPL-3.0-or-later')
+depends=('bash' 'jq' 'curl' 'python')
+optdepends=(
+    'ai-usagebar: 供应商余额/配额数据源（AUR: ai-usagebar）'
+    'ccusage: Claude Code 本地用量数据源（npm i -g ccusage）'
+    'rsync: overlay 同步更快'
+    'clavis-shell: 目标外壳（由上游安装器提供，不在官方仓库）'
+)
+install="$pkgname.install"
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')   # 发版时替换为真实校验和
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    # 数据树：引擎按脚本位置定位仓库根（scripts/../ = 本目录）
+    install -Dm755 bin/clavis-ai-usage "$pkgdir/usr/lib/clavis-ai-usage/bin/clavis-ai-usage"
+    install -Dm755 scripts/clavis_overlay.py "$pkgdir/usr/lib/clavis-ai-usage/scripts/clavis_overlay.py"
+    install -Dm755 scripts/patch_clavis_ai_card.py "$pkgdir/usr/lib/clavis-ai-usage/scripts/patch_clavis_ai_card.py"
+    install -Dm644 patches/manifest.json "$pkgdir/usr/lib/clavis-ai-usage/patches/manifest.json"
+    install -Dm644 patches/README.md "$pkgdir/usr/lib/clavis-ai-usage/patches/README.md"
+    for f in qml/*; do
+        install -Dm644 "$f" "$pkgdir/usr/lib/clavis-ai-usage/qml/$(basename "$f")"
+    done
+
+    # 许可证与声明
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+
+    # CLI 入口
+    install -d "$pkgdir/usr/bin"
+    ln -s /usr/lib/clavis-ai-usage/bin/clavis-ai-usage "$pkgdir/usr/bin/clavis-ai-usage"
+    cat > "$pkgdir/usr/bin/clavis-ai-usage-overlay" <<'EOF'
+#!/usr/bin/env bash
+# clavis-ai-usage overlay 引擎（安装/同步/校验/卸载）
+exec python3 /usr/lib/clavis-ai-usage/scripts/clavis_overlay.py "$@"
+EOF
+    chmod 755 "$pkgdir/usr/bin/clavis-ai-usage-overlay"
+}

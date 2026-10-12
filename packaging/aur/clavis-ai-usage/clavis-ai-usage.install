@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 LumiACGN
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+post_install() {
+    cat <<'EOF'
+== clavis-ai-usage 已安装。接下来（以你自己的用户身份）运行：
+
+     clavis-ai-usage-overlay install --dry-run   # 先预览（不写任何文件）
+     clavis-ai-usage-overlay install             # 正式安装
+
+   安装采用 overlay 方式：把 Clavis 源码树镜像到 ~/.config/quickshell/clavis/
+   再叠加补丁，不触碰 /etc。需要目标机已装 Clavis Shell
+   （https://github.com/StatIndet/quickshell）。
+   Clavis 升级后重新对齐：clavis-ai-usage-overlay sync
+EOF
+}
+
+post_upgrade() {
+    post_install
+}
+
+pre_remove() {
+    echo "== 卸载前建议先移除 overlay：clavis-ai-usage-overlay uninstall"
+}
