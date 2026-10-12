@@ -1,0 +1,973 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 LumiACGN
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# clavis-ai-usage — aggregate AI usage/quota data for the Clavis「AI 用量」看板。
+#
+# Contract (consumed by Services/AiUsageService.qml):
+#   * stdout: exactly one JSON document (schema_version = 1); always exit 0
+#   * stderr: diagnostics only
+#
+# Data layers:
+#   * ai-usagebar usage --json    DeepSeek balance / GLM+Kimi quotas / OpenRouter
+#   * ccusage daily + blocks      local Claude Code usage (tokens, cost)
+#   * optional New-API relay      direct curl, disabled until configured
+#   * optional DeepSeek platform  non-public web API, per-day official usage（默认关闭）
+#
+# Flags: 见 --help。凭据来源可用 --explain-keys 审计（只显示来源，不显示值）。
+set -uo pipefail
+umask 077
+
+VERSION="0.1.0"
+
+HOME_DIR="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
+if [ -z "$HOME_DIR" ]; then
+    printf 'ERROR: 无法确定用户家目录（HOME 未设置）\n' >&2
+    exit 1
+fi
+CONFIG_DIR="${CLAVIS_AI_USAGE_CONFIG_DIR:-$HOME_DIR/.config/clavis-ai-usage}"
+CONFIG=""   # 真正的解析在后面（依赖 log 函数与命令行 --config）
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME_DIR/.cache}/clavis-ai-usage"
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/clavis-ai-usage.lock"
+LAST_GOOD="$CACHE_DIR/last-good.json"
+PROVIDERS_CACHE="$CACHE_DIR/providers.json"
+LOCAL_CACHE="$CACHE_DIR/local.json"
+RELAY_STATUS_CACHE="$CACHE_DIR/relay-status.json"
+HISTORY_FILE="$CACHE_DIR/history.json"
+BALANCE_DAY_FILE="$CACHE_DIR/balance-day.json"
+SPEND_HISTORY_FILE="$CACHE_DIR/spend-history.json"
+OFFICIAL_CACHE="$CACHE_DIR/official.json"
+OFFICIAL_SUMMARY_FILE="$CACHE_DIR/official-summary.json"
+HISTORY_KEEP_DAYS=180
+TTL_PROVIDERS="${CLAVIS_AI_USAGE_TTL_PROVIDERS:-540}"
+TTL_LOCAL="${CLAVIS_AI_USAGE_TTL_LOCAL:-300}"
+TTL_RELAY_STATUS=86400
+
+FORCE=0
+OFFLINE=0
+PROBE_OFFICIAL=0
+EXPLAIN_KEYS=0
+CONFIG_FLAG=""
+
+usage() {
+    cat <<'USAGE'
+clavis-ai-usage —— Clavis「AI 用量」看板的数据聚合脚本（stdout 输出单个 JSON，schema_version=1）
+
+用法: clavis-ai-usage [选项]
+
+选项:
+  --force            忽略缓存 TTL，强制重新抓取
+  --offline          只用本地缓存，不发任何网络请求
+  --official-test    探测 DeepSeek 平台接口并打印诊断（调试用）
+  --config <路径>    指定配置文件（优先级最高）
+  --explain-keys     打印每个凭据的来源（env / 配置文件 / ~/.claude 兜底 / 未配置），
+                     只显示来源，永不显示值
+  --version          打印版本
+  -h, --help         显示本帮助
+
+配置文件解析顺序（先命中先用）:
+  1. --config 指定
+  2. 环境变量 CLAVIS_AI_USAGE_CONFIG
+  3. ~/.config/clavis-ai-usage/config.json（推荐）
+  4. ~/.config/clavis/ai-usage.json（旧路径，兼容但仍可用）
+凭据也可用环境变量提供：DEEPSEEK_API_KEY / ZAI_API_KEY / KIMI_API_KEY / OPENROUTER_API_KEY。
+USAGE
+}
+
+usage_short() {
+    printf '用法: clavis-ai-usage [--force|--offline|--official-test|--config <路径>|--explain-keys|--help]\n' >&2
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force) FORCE=1 ;;
+        --offline) OFFLINE=1 ;;
+        --official-test) PROBE_OFFICIAL=1 ;;
+        --explain-keys) EXPLAIN_KEYS=1 ;;
+        --config)
+            shift
+            if [ $# -eq 0 ]; then
+                printf 'ERROR: --config 需要一个路径参数\n' >&2
+                exit 2
+            fi
+            CONFIG_FLAG="$1" ;;
+        --version) printf 'clavis-ai-usage %s\n' "$VERSION"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'ERROR: 未知参数：%s\n' "$1" >&2; usage_short; exit 2 ;;
+    esac
+    shift
+done
+
+mkdir -p "$CACHE_DIR" 2>/dev/null
+chmod 700 "$CACHE_DIR" 2>/dev/null
+
+log() { printf '%s\n' "$*" >&2; }
+
+# 配置文件解析（优先级见 --help）；命中旧路径时给出迁移提示、权限过宽时告警
+LEGACY_CONFIG="$HOME_DIR/.config/clavis/ai-usage.json"
+if [ -n "$CONFIG_FLAG" ]; then
+    CONFIG="$CONFIG_FLAG"
+elif [ -n "${CLAVIS_AI_USAGE_CONFIG:-}" ]; then
+    CONFIG="$CLAVIS_AI_USAGE_CONFIG"
+elif [ -f "$CONFIG_DIR/config.json" ]; then
+    CONFIG="$CONFIG_DIR/config.json"
+elif [ -f "$LEGACY_CONFIG" ]; then
+    CONFIG="$LEGACY_CONFIG"
+    log "注意：正在使用旧路径配置（$LEGACY_CONFIG）；建议迁移到 $CONFIG_DIR/config.json"
+else
+    CONFIG="$CONFIG_DIR/config.json"
+fi
+if [ -f "$CONFIG" ]; then
+    _cfg_perms="$(stat -c '%a' "$CONFIG" 2>/dev/null || printf '')"
+    case "$_cfg_perms" in
+        600|400|"") ;;
+        *) log "警告：$CONFIG 权限为 $_cfg_perms，建议 chmod 600（其中可能含 API key）" ;;
+    esac
+fi
+
+emergency_json() {
+    jq -n --argjson now "$(date +%s)" \
+        '{schema_version:1, generated_at:$now, error:"no data yet", stale_sources:[], providers:[], local:{status:"error"}}'
+}
+
+emit_last_good() {
+    if [ -s "$LAST_GOOD" ]; then cat "$LAST_GOOD"; else emergency_json; fi
+    exit 0
+}
+
+# The QML side sends SIGTERM when its deadline expires: serve the last good
+# document rather than nothing.  All children run under `timeout`, so the
+# signal cannot hang this script indefinitely.
+trap emit_last_good TERM INT
+
+# 仅诊断类命令跳过锁（它们不写数据、不抓取，不应被其它实例挡在门外）
+if [ "$EXPLAIN_KEYS" != 1 ] && [ "$PROBE_OFFICIAL" != 1 ]; then
+    mkdir -p "$(dirname "$LOCK")" 2>/dev/null
+    # NB: no `2>/dev/null` here — an `exec` redirection is permanent, so it would
+    # silence every log() line for the rest of the run.
+    exec 9>"$LOCK" || emit_last_good
+    flock -n 9 || { log "another instance is running; serving cache"; emit_last_good; }
+fi
+
+# 工具解析优先级：环境变量覆盖 > 配置路径 > PATH > 默认路径
+resolve_tool() { # $1=环境变量值 $2=配置路径 $3=命令名 $4=默认路径
+    if [ -n "$1" ]; then
+        [ -x "$1" ] && { printf '%s' "$1"; return 0; }
+        return 1
+    fi
+    if [ -n "$2" ] && [ "$2" != "null" ]; then
+        [ -x "$2" ] && { printf '%s' "$2"; return 0; }
+        return 1
+    fi
+    local found
+    found="$(command -v "$3" 2>/dev/null)"
+    if [ -n "$found" ]; then printf '%s' "$found"; return 0; fi
+    if [ -x "$4" ]; then printf '%s' "$4"; return 0; fi
+    return 1
+}
+
+cfg() { [ -f "$CONFIG" ] && jq -r "$1" "$CONFIG" 2>/dev/null; }
+
+# cfg with a fallback: treats both a missing config file and a null/missing key
+# ("null" / empty output) as "use the default".
+cfgv() { # $1 = jq path, $2 = default
+    local value
+    value="$(cfg "$1")"
+    if [ -n "$value" ] && [ "$value" != "null" ]; then printf '%s' "$value"; else printf '%s' "$2"; fi
+}
+
+# Accept only plain non-negative numbers; anything else falls back to the
+# default (config typos must not corrupt every derived CNY figure).
+num() { # $1 = candidate, $2 = default
+    case "${1:-}" in
+        "" | null | *[!0-9.]* | *.*.*) printf '%s' "$2" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+int() { # like num, but integers only (day counts, TTLs, UTC offsets)
+    case "${1:-}" in
+        "" | null | *[!0-9]*) printf '%s' "$2" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+cache_age() { [ -s "$1" ] && printf '%s' "$(( $(date +%s) - $(stat -c %Y "$1") ))" || printf '999999999'; }
+
+atomic_write() { # reads stdin, writes $1 atomically
+    local tmp="$1.tmp.$$"
+    cat > "$tmp" && mv -f "$tmp" "$1"
+}
+
+# Merge ccusage daily rows into the persistent per-day history file, keeping
+# the raw DeepSeek token buckets per day (cache_read / input_uncached / output)
+# so the dashboard can chart composition and cache hit rate without ever
+# re-reading the transcripts.  Derived CNY figures are computed at emit time
+# from the current price table, so editing prices re-prices the whole history.
+#
+# Shape: {"YYYY-MM-DD": {tokens, cache_read, input_uncached, output,
+#                        cache_write, cost, models[], [spend_cny, ...]}}
+# Foreign keys written by other helpers (spend history) survive the merge.
+# Called from fetch_local, whose stdout is captured: this must print NOTHING.
+merge_history() { # $1 = raw ccusage daily JSON
+    local daily="$1" old merged
+    old="$(jq -c 'if type == "object" then . else {} end' "$HISTORY_FILE" 2>/dev/null)" || old="{}"
+    [ -n "$old" ] || old="{}"
+    merged="$(printf '%s' "$daily" | jq -c --argjson old "$old" --argjson keep "$HISTORY_KEEP_DAYS" \
+        --arg today "$(date +%F)" '
+        [(.daily // [])[]
+         | {key: .period,
+            value: {
+                tokens: (.totalTokens // 0),
+                cache_read: (.cacheReadTokens // 0),
+                input_uncached: (.inputTokens // 0),
+                output: (.outputTokens // 0),
+                cache_write: (.cacheCreationTokens // 0),
+                cost_usd: (.totalCost // 0),
+                models: (.modelsUsed // [])
+            }}] | from_entries as $new
+        | (($old | keys) + ($new | keys) | unique | sort | reverse | .[0:$keep]) as $days
+        | reduce $days[] as $day ({};
+            ($old[$day] // {}) as $o | ($new[$day] // {}) as $n
+            | . + {($day): (
+                if ($n | length) == 0 then $o
+                # Today is still accumulating: always take the fresh numbers.
+                elif $day == $today then ($o + $n)
+                # Reloaded/upgraded rows (ccusage re-reports a day it already
+                # saw) may fill in buckets; a *smaller* re-report means the
+                # transcripts were pruned, and that must not erase history.
+                elif (($n.tokens // 0) >= ($o.tokens // 0)) then ($o + $n)
+                else $o end)})' 2>/dev/null)" || return 0
+    [ -n "$merged" ] && printf '%s' "$merged" | atomic_write "$HISTORY_FILE"
+    return 0
+}
+
+# Track the balance-provider account balance across the day so the UI can
+# show real CNY spend (balance delta) instead of the USD price-table estimate.
+# Sets TODAY_SPEND (number or empty) and SPEND_TOPUP; prints nothing.
+TODAY_SPEND=""
+SPEND_TOPUP="false"
+BALANCE_CNY=""
+track_balance() {
+    local raw amount today state result
+    raw="$(printf '%s' "$PROVIDERS_JSON" | jq -r --arg id "$BALANCE_PROVIDER" \
+        '[.[] | select(.id == $id)] | first | (.display // "")' 2>/dev/null)"
+    amount="$(printf '%s' "$raw" | tr -cd '0-9.')"
+    case "$amount" in
+        "" | *[!0-9.]* | .* | *. | *.*.*) return 0 ;;
+    esac
+    BALANCE_CNY="$amount"
+
+    today="$(date +%F)"
+    state="$(jq -c 'if type == "object" then . else {} end' "$BALANCE_DAY_FILE" 2>/dev/null)" || state="{}"
+    [ -n "$state" ] || state="{}"
+    if [ "$(printf '%s' "$state" | jq -r '.date // ""')" != "$today" ]; then
+        state="$(jq -nc --arg d "$today" --argjson b "$amount" '{date: $d, first: $b, last: $b}')"
+    else
+        state="$(printf '%s' "$state" | jq -c --argjson b "$amount" '.last = $b')"
+    fi
+    printf '%s' "$state" | atomic_write "$BALANCE_DAY_FILE"
+
+    result="$(printf '%s' "$state" | jq -c '
+        {spend: (if .first >= .last then (((.first - .last) * 100 | round) / 100) else 0 end),
+         topup: (.last > .first)}')"
+    TODAY_SPEND="$(printf '%s' "$result" | jq -r '.spend')"
+    [ "$(printf '%s' "$result" | jq -r '.topup')" = "true" ] && SPEND_TOPUP="true"
+
+    # Persist the day's real spend so the history can show balance-delta CNY per
+    # day (not just today).  The row is upserted on every run; `first` stays the
+    # first sample of the day, so a PC that is off at midnight can only
+    # under-report that day — the card labels such days accordingly.
+    local first_sample topup_json all merged
+    first_sample="$(printf '%s' "$state" | jq -r '.first // 0')"
+    topup_json="$([ "$SPEND_TOPUP" = "true" ] && printf true || printf false)"
+    all="$(jq -c 'if type == "object" then . else {} end' "$SPEND_HISTORY_FILE" 2>/dev/null)" || all="{}"
+    [ -n "$all" ] || all="{}"
+    merged="$(printf '%s' "$all" | jq -c --arg d "$today" --argjson amount "$amount" \
+        --argjson first "$first_sample" --argjson spend "$TODAY_SPEND" \
+        --argjson topup "$topup_json" --argjson keep "$HISTORY_KEEP_DAYS" '
+        . + {($d): {date: $d,
+                    first: (.[$d].first // $first),
+                    last: $amount,
+                    # A day with a top-up has no trustworthy delta: record null
+                    # so averages skip it instead of counting a fake zero.
+                    spend: (if $topup then null else $spend end),
+                    topup: $topup,
+                    samples: ((.[$d].samples // 0) + 1)}}
+        | to_entries | sort_by(.key) | .[-$keep:] | from_entries' 2>/dev/null)" || merged=""
+    [ -n "$merged" ] && printf '%s' "$merged" | atomic_write "$SPEND_HISTORY_FILE"
+    return 0
+}
+
+# Dense N-day series for the dashboard page (missing days filled with zeros).
+# Raw token counts come from history.json; every CNY figure is derived here
+# from the *current* price table so a price edit re-prices past days too.
+read_history_range() { # $1 = number of days
+    local raw spend days_n="${1:-30}"
+    raw="$(jq -c 'if type == "object" then . else {} end' "$HISTORY_FILE" 2>/dev/null)" || raw="{}"
+    [ -n "$raw" ] || raw="{}"
+    spend="$(jq -c 'if type == "object" then . else {} end' "$SPEND_HISTORY_FILE" 2>/dev/null)" || spend="{}"
+    [ -n "$spend" ] || spend="{}"
+    days="$(for i in $(seq "$((days_n - 1))" -1 0); do date -d "-$i day" +%F; done \
+        | jq -R -s 'split("\n") | map(select(length > 0))')"
+    printf '%s' "$raw" | jq -c \
+        --argjson days "$days" \
+        --argjson spend "$spend" \
+        --argjson hit "$PRICE_HIT" --argjson miss "$PRICE_MISS" --argjson out "$PRICE_OUT" \
+        --argjson peak "$PEAK_MULT" --argjson official "$OFFICIAL_JSON" '
+        [ $days[] as $d
+          | (.[$d] // {}) as $e
+          | (($e.cache_read // 0) | tonumber) as $cr
+          | (($e.input_uncached // 0) | tonumber) as $im
+          | (($e.output // 0) | tonumber) as $ou
+          | ($spend[$d] // {}) as $sp
+          | ($official[$d] // {}) as $off
+          | (($off.cost_cny // null)) as $off_cost
+          # The official (billed) buckets win wherever the platform API has
+          # them: the local transcript counts run ~3x high (sub-agent/retry
+          # messages are logged more than once) and mixing the two per day
+          # would make the bars disagree with the CNY figure beside them.
+          # Only a *non-empty* official day overrides the local one: the
+          # monthly response lists every day of the month, and letting a
+          # zero-token official day win would mask local usage the platform
+          # has not caught up with yet.
+          | (($off.tokens // 0) > 0) as $off_tokens
+          | (if $off_tokens then ($off.cache_read // 0) else $cr end) as $ecr
+          | (if $off_tokens then ($off.input_uncached // 0) else $im end) as $eim
+          | (if $off_tokens then ($off.output // 0) else $ou end) as $eou
+          | ($ecr + $eim) as $prompt
+          | ($off_tokens or (($e.cache_read // null) != null)) as $known
+          | (((($ecr * $hit + $eim * $miss + $eou * $out) / 1000000.0) * 100 | round) / 100) as $est
+          | {
+              date: $d,
+              tokens: (if $off_tokens then ($off.tokens // 0)
+                       else (($e.tokens // 0) | tonumber) end),
+              cache_read: $ecr,
+              input_uncached: $eim,
+              output: $eou,
+              cache_write: (($e.cache_write // 0) | tonumber),
+              models: ($e.models // []),
+              # "official" = DS 账单口径（UTC 日界），"local" = 本地日志（北京时间）
+              tokens_source: (if $off_tokens then "official"
+                              elif (($e.cache_read // null) != null) then "local"
+                              else "none" end),
+              # false for pre-upgrade rows that only ever stored a day total:
+              # their hit rate is unknown, not zero.
+              known: $known,
+              hit_rate: (if $prompt > 0 then ((($ecr * 100.0 / $prompt) * 100 | round) / 100) else null end),
+              est_cny: $est,
+              est_peak_cny: (((($ecr * $hit * $peak + $eim * $miss * $peak + $eou * $out * $peak) / 1000000.0)
+                              * 100 | round) / 100),
+              cache_savings_cny: ((($ecr * ($miss - $hit)) / 1000000.0) * 100 | round) / 100,
+              spend_cny: ($sp.spend // null),
+              spend_topup: ($sp.topup // false),
+              official: (if ($off.tokens // null) != null then $off else null end),
+              official_cost_cny: $off_cost,
+              cost_usd_estimate: ($e.cost_usd // null),
+              cost_display_cny: (if $off_cost != null then $off_cost
+                                 elif ($sp.spend // null) != null then $sp.spend
+                                 elif ($known and ((($e.tokens // 0) | tonumber) > 0)) then $est
+                                 else null end),
+              cost_source: (if $off_cost != null then "official"
+                            elif ($sp.spend // null) != null then "spend"
+                            elif ($known and ((($e.tokens // 0) | tonumber) > 0)) then "estimate"
+                            else "none" end)
+            } ]' 2>/dev/null \
+        || printf '[]'
+}
+
+AUB="$(resolve_tool "${AI_USAGEBAR_BIN:-}" "$(cfg '.aiUsagebar.path // empty')" \
+    ai-usagebar "$HOME_DIR/.local/bin/ai-usagebar")" || AUB=""
+CCU="$(resolve_tool "${CCUSAGE_BIN:-}" "$(cfg '.ccusage.path // empty')" \
+    ccusage "$HOME_DIR/.npm-global/bin/ccusage")" || CCU=""
+
+# 凭据：环境变量优先，其次配置文件；可选从 ~/.claude/settings.json 兜底（显式 opt-in）
+DEEPSEEK_KEY="${DEEPSEEK_API_KEY:-$(cfg '.deepseekApiKey // empty')}"
+if [ -z "$DEEPSEEK_KEY" ] && [ "$(cfgv '.deepseekApiKeyFromClaudeSettings' false)" = "true" ]; then
+    DEEPSEEK_KEY="$(jq -r '.env.ANTHROPIC_AUTH_TOKEN // empty' "$HOME_DIR/.claude/settings.json" 2>/dev/null)"
+fi
+ZAI_KEY="${ZAI_API_KEY:-$(cfg '.providers.zaiApiKey // empty')}"
+# Which provider entry carries the account balance used for real CNY spend.
+BALANCE_PROVIDER="$(cfg '.balanceProvider // "deepseek"')"
+KIMI_KEY="${KIMI_API_KEY:-$(cfg '.providers.kimiApiKey // empty')}"
+OR_KEY="${OPENROUTER_API_KEY:-$(cfg '.providers.openrouterApiKey // empty')}"
+
+# --------------------------------------------------------- history & pricing
+# deepseek-flash list prices, CNY per 1M tokens (off-peak; peak is x2 on
+# Beijing workdays 09:00-12:00 and 14:00-18:00).  Only used for the *estimate*
+# column — real spend always comes from the balance delta.
+HISTORY_DAYS="$(int "$(cfgv '.historyWindowDays' 30)" 30)"
+[ "$HISTORY_DAYS" -ge 7 ] && [ "$HISTORY_DAYS" -le 90 ] || HISTORY_DAYS=30
+PRICE_HIT="$(num "$(cfgv '.pricing.offPeak.cacheHit' 0.02)" 0.02)"
+PRICE_MISS="$(num "$(cfgv '.pricing.offPeak.cacheMiss' 1)" 1)"
+PRICE_OUT="$(num "$(cfgv '.pricing.offPeak.output' 4)" 4)"
+PEAK_MULT="$(num "$(cfgv '.pricing.peakMultiplier' 2)" 2)"
+PRICE_SOURCE="$([ -n "$(cfgv '.pricing.offPeak.cacheHit' '')" ] && printf config || printf default)"
+OFFICIAL_ENABLED="$(cfgv '.official.enabled' false)"
+OFFICIAL_TOKEN_FILE="$(cfgv '.official.tokenFile' "$HOME_DIR/.config/clavis/deepseek-platform.token")"
+# shellcheck disable=SC2088  # 「~/」为字面匹配，下一行手工展开为 $HOME
+case "$OFFICIAL_TOKEN_FILE" in "~/"*) OFFICIAL_TOKEN_FILE="$HOME_DIR/${OFFICIAL_TOKEN_FILE#\~/}" ;; esac
+OFFICIAL_BASE="$(cfgv '.official.baseUrl' 'https://platform.deepseek.com')"
+
+# --explain-keys：只显示凭据来源，永不显示值（安全审计入口）
+if [ "$EXPLAIN_KEYS" = 1 ]; then
+    _src() { # $1=env 值  $2=配置文件中的值  $3=是否允许 ~/.claude 兜底
+        if [ -n "$1" ]; then
+            printf '环境变量'
+        elif [ -n "$2" ] && [ "$2" != "null" ]; then
+            printf '配置文件（%s）' "$CONFIG"
+        elif [ "$3" = "true" ] && jq -e '.env.ANTHROPIC_AUTH_TOKEN' \
+                "$HOME_DIR/.claude/settings.json" >/dev/null 2>&1; then
+            # shellcheck disable=SC2088  # 输出文案里的「~/」是给用户看的字面路径
+            printf '~/.claude/settings.json（opt-in 兜底）'
+        else
+            printf '未配置'
+        fi
+    }
+    printf '凭据来源（只显示来源，不显示值）：\n'
+    printf '  deepseek    %s\n' "$(_src "${DEEPSEEK_API_KEY:-}" "$DEEPSEEK_KEY" "$(cfgv '.deepseekApiKeyFromClaudeSettings' false)")"
+    printf '  zai         %s\n' "$(_src "${ZAI_API_KEY:-}" "$ZAI_KEY" false)"
+    printf '  kimi        %s\n' "$(_src "${KIMI_API_KEY:-}" "$KIMI_KEY" false)"
+    printf '  openrouter  %s\n' "$(_src "${OPENROUTER_API_KEY:-}" "$OR_KEY" false)"
+    printf '  relay       %s\n' "$(_src "${RELAY_API_KEY:-}" "$(cfg '.relay.apiKey // empty')" false)"
+    printf '  official-token 文件: %s（%s）\n' "$OFFICIAL_TOKEN_FILE" \
+        "$([ -f "$OFFICIAL_TOKEN_FILE" ] && printf '存在' || printf '不存在')"
+    printf '配置文件: %s\n' "$CONFIG"
+    exit 0
+fi
+OFFICIAL_TTL="$(int "$(cfgv '.official.ttlSeconds' 3600)" 3600)"
+OFFICIAL_TZ="$(int "$(cfgv '.official.tz' 28800)" 28800)"
+OFFICIAL_DAYS="$(int "$(cfgv '.official.days' 30)" 30)"
+OFFICIAL_JSON="{}"
+OFFICIAL_STATUS="disabled"
+OFFICIAL_ERROR=""
+[ "$OFFICIAL_ENABLED" = "true" ] && OFFICIAL_STATUS="error"
+
+STALE=()
+ERROR_MSG=""
+
+# ---------------------------------------------------------------- providers
+fetch_providers() {
+    [ -n "$AUB" ] || return 1
+    local raw
+    raw="$(DEEPSEEK_API_KEY="$DEEPSEEK_KEY" ZAI_API_KEY="$ZAI_KEY" KIMI_API_KEY="$KIMI_KEY" \
+        OPENROUTER_API_KEY="$OR_KEY" timeout 15 "$AUB" usage --json 2>>"$CACHE_DIR/ai-usagebar.log")" || return 1
+    printf '%s' "$raw" | jq -e '.schema_version == 1 and (.entries | type == "array")' >/dev/null 2>&1 || return 1
+    printf '%s' "$raw" | jq -c '
+        [.entries[] | . as $e |
+            (($e.metrics // []) | map(select((.percent | type) == "number")) | sort_by(.percent) | reverse | first) as $worst |
+            (($e.sections // []) | map(select(.type == "text")) | first) as $text |
+            (($e.sections // []) | map(select(.type == "block")) | first) as $block |
+            {
+                id: ($e.id // ""),
+                name: ($e.display_name // $e.name // $e.id // ""),
+                plan: ($e.plan // ""),
+                kind: (if (($e.metrics // []) | length) > 0 then "quota" else "balance" end),
+                status: (if $e.status == "ready" then "ready" else "error" end),
+                stale: ($e.stale // false),
+                fetched_at: ((($e.fetched_at // "") | sub("\\.[0-9]+Z$"; "Z")) as $t | ($t | try fromdateiso8601 catch 0)),
+                error: (($e.error // "") | tostring | .[0:120]),
+                display: (
+                    if (($e.metrics // []) | length) > 0 then
+                        ($worst.headline // (if ($worst.percent | type) == "number"
+                            then (((($worst.percent) * 10 | round) / 10) | tostring) + "%"
+                            else ($worst.value // "") end))
+                    else ($text.value // "") end),
+                detail: (
+                    if (($e.metrics // []) | length) > 0 then
+                        (($e.metrics // []) | map((.label // "") + " " + (if (.percent | type) == "number"
+                            then ((((.percent) * 10 | round) / 10) | tostring) + "%" else (.value // "") end)) | join(" · "))
+                    else (($block.body // []) | join(" · ")) end),
+                percent: (if ($worst.percent | type) == "number" then $worst.percent else -1 end),
+                severity: ($worst.severity // (if $e.status == "ready" then "ok" else "error" end)),
+                reset_at: (
+                    ($worst.reset_at // 0) as $r |
+                    if ($r | type) == "number" then (if $r > 100000000000 then (($r / 1000) | floor) else $r end)
+                    elif (($r | type) == "string" and $r != "") then ($r | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch 0)
+                    else 0 end)
+            }
+        ]'
+}
+
+if [ "$OFFLINE" = 0 ] && { [ "$FORCE" = 1 ] || [ "$(cache_age "$PROVIDERS_CACHE")" -ge "$TTL_PROVIDERS" ]; }; then
+    if [ -z "$AUB" ]; then
+        ERROR_MSG="ai-usagebar not installed"
+    elif new_providers="$(fetch_providers)"; then
+        printf '%s' "$new_providers" | jq -e 'type == "array"' >/dev/null 2>&1 \
+            && printf '%s' "$new_providers" | atomic_write "$PROVIDERS_CACHE"
+    else
+        log "ai-usagebar fetch failed; serving previous data if any"
+        STALE+=("ai-usagebar")
+        [ -s "$PROVIDERS_CACHE" ] || ERROR_MSG="ai-usagebar fetch failed"
+    fi
+fi
+PROVIDERS_JSON="[]"
+[ -s "$PROVIDERS_CACHE" ] && PROVIDERS_JSON="$(cat "$PROVIDERS_CACHE")"
+
+# -------------------------------------------------------------------- local
+fetch_local() {
+    [ -n "$CCU" ] || return 1
+    local daily blocks today
+    daily="$(timeout 12 "$CCU" daily --json 2>>"$CACHE_DIR/ccusage.log")" || return 1
+    blocks="$(timeout 12 "$CCU" blocks --json 2>>"$CACHE_DIR/ccusage.log")" || return 1
+    printf '%s' "$daily" | jq -e 'type == "object" and (.daily | type == "array")' >/dev/null 2>&1 || return 1
+    printf '%s' "$blocks" | jq -e 'type == "object" and (.blocks | type == "array")' >/dev/null 2>&1 || return 1
+    merge_history "$daily"
+    today="$(date +%F)"
+    jq -n --argjson daily "$daily" --argjson blocks "$blocks" --arg today "$today" '
+        ($daily.daily // [] | map(select(.period == $today)) | first) as $d |
+        ($blocks.blocks // [] | map(select(.isActive == true)) | first) as $b |
+        ($daily.daily // [] | map(.modelBreakdowns // []) | add) as $mb |
+        {
+            status: "ready",
+            today_tokens: ($d.totalTokens // 0),
+            today_cost_usd: ($d.totalCost // 0),
+            missing_pricing: ((($mb // []) | map(select(.missingPricing == true)) | length) > 0),
+            block_active: ($b != null),
+            block_tokens: ($b.totalTokens // 0),
+            block_remaining_min: ($b.projection.remainingMinutes // 0),
+            block_cost_usd: ($b.costUSD // 0),
+            block_cost_per_hour: ($b.burnRate.costPerHour // 0),
+            block_tokens_per_min: ($b.burnRate.tokensPerMinute // 0),
+            block_projection_tokens: ($b.projection.totalTokens // 0),
+            block_projection_cost_usd: ($b.projection.totalCost // 0)
+        }'
+}
+
+if [ "$(cfg '.ccusage.enabled // true')" != "false" ]; then
+    if [ "$OFFLINE" = 0 ] && { [ "$FORCE" = 1 ] || [ "$(cache_age "$LOCAL_CACHE")" -ge "$TTL_LOCAL" ]; }; then
+        if [ -z "$CCU" ]; then
+            log "ccusage not installed"
+        elif new_local="$(fetch_local)"; then
+            printf '%s' "$new_local" | jq -e 'type == "object"' >/dev/null 2>&1 \
+                && printf '%s' "$new_local" | atomic_write "$LOCAL_CACHE"
+        else
+            log "ccusage fetch failed; serving previous data if any"
+            STALE+=("ccusage")
+        fi
+    fi
+fi
+LOCAL_JSON='{"status":"unavailable"}'
+[ -s "$LOCAL_CACHE" ] && LOCAL_JSON="$(cat "$LOCAL_CACHE")"
+
+# -------------------------------------------------------------------- relay
+if [ "$(cfg '.relay.enabled // false')" = "true" ] && [ "$OFFLINE" = 0 ]; then
+    RELAY_BASE="$(cfg '.relay.baseUrl // empty')"
+    RELAY_KEY="$(cfg '.relay.apiKey // empty')"
+    if [ -n "$RELAY_BASE" ] && [ -n "$RELAY_KEY" ]; then
+        if [ "$(cache_age "$RELAY_STATUS_CACHE")" -ge "$TTL_RELAY_STATUS" ]; then
+            curl -sS --connect-timeout 4 -m 8 "$RELAY_BASE/api/status" 2>/dev/null | atomic_write "$RELAY_STATUS_CACHE" || true
+        fi
+        QPU=500000
+        [ -s "$RELAY_STATUS_CACHE" ] && QPU="$(jq -r '.data.quota_per_unit // 500000' "$RELAY_STATUS_CACHE" 2>/dev/null)"
+        RELAY_RAW="$(curl -sS --connect-timeout 4 -m 8 -H "Authorization: Bearer $RELAY_KEY" \
+            "$RELAY_BASE/api/usage/token/" 2>>"$CACHE_DIR/relay.log")" || RELAY_RAW=""
+        if printf '%s' "$RELAY_RAW" | jq -e '.data.total_granted != null' >/dev/null 2>&1; then
+            RELAY_ENTRY="$(printf '%s' "$RELAY_RAW" | jq -c --argjson qpu "${QPU:-500000}" --argjson now "$(date +%s)" '
+                .data as $d |
+                ($qpu | if . > 0 then . else 500000 end) as $q |
+                ($d.total_used / $q) as $used | ($d.total_granted / $q) as $limit | ($d.total_available / $q) as $remain |
+                {
+                    id: "relay", name: "中转站", plan: "", kind: "relay",
+                    status: "ready", stale: false, fetched_at: $now, error: "",
+                    display: ("$" + (($used * 100 | round) / 100 | tostring) + " / $" + (($limit * 100 | round) / 100 | tostring)),
+                    detail: (((($used / (if $limit > 0 then $limit else 1 end) * 1000) | round) / 10 | tostring) + "% used · remaining $" + (($remain * 100 | round) / 100 | tostring)),
+                    percent: (if $limit > 0 then (($used / $limit) * 100) else -1 end),
+                    severity: "normal", reset_at: 0
+                }')" || RELAY_ENTRY=""
+        else
+            RELAY_ENTRY="$(jq -n --argjson now "$(date +%s)" '{id:"relay", name:"中转站", plan:"", kind:"relay", status:"error", stale:false, fetched_at:$now, error:"relay fetch failed", display:"", detail:"", percent:-1, severity:"error", reset_at:0}')"
+        fi
+        [ -n "${RELAY_ENTRY:-}" ] && PROVIDERS_JSON="$(printf '%s' "$PROVIDERS_JSON" | jq -c --argjson entry "$RELAY_ENTRY" '. + [$entry]')"
+    fi
+fi
+
+# ------------------------------------------------------------------ official
+# DeepSeek platform private usage API.  Authenticates with the *web session
+# token* (localStorage userToken) — an sk- API key is rejected with 40003.
+# Disabled by default; every failure path keeps the previous snapshot and only
+# surfaces as a status row / stale source in the UI.
+#
+# Endpoints (verified live 2026-10-08; re-check anytime with
+# `clavis-ai-usage --official-test`):
+#   GET /api/v0/usage/amount?month=<M>&year=<YYYY>[&tz=<seconds>]   ← works
+#   GET /api/v0/usage/cost?month=<M>&year=<YYYY>[&tz=<seconds>]     ← same shape, CNY
+#   The /by_api_key/* variants reject a web session token with
+#   biz_code 1 INVALID_PARAM, and `tz` appears to be ignored here: the daily
+#   buckets are NOT Beijing days (local 10-06 = 0 tokens while the platform
+#   reported 108.9M for that date), so treat official days as its own calendar.
+# Response shape:
+#   envelope      {code, msg, data:{biz_code, biz_msg, biz_data}} — non-zero
+#                 code/biz_code is an error, 40002/40003 = dead session token
+#   amount        biz_data = {total, days:[{date, data:[{model, usage:[{type, amount}]}]}]}
+#   cost          biz_data = [ {total, days:[…same…], currency} ]  (amounts in CNY)
+#   type ∈ REQUEST / PROMPT_TOKEN / PROMPT_CACHE_HIT_TOKEN /
+#          PROMPT_CACHE_MISS_TOKEN / RESPONSE_TOKEN      (PROMPT_TOKEN is 0 here)
+#   amounts are strings ("1234", not 1234)
+#
+# Token counts from the local transcripts run ~3x higher than the billed ones
+# (sub-agent/retry messages appear in more than one JSONL), while the implied
+# unit prices match the public price table exactly — so wherever the official
+# numbers exist they replace the local ones for that day.
+OFFICIAL_HTTP_CODE=""
+# These helpers communicate through globals, never through stdout: they are
+# called from inside fetch_official, and a command substitution would run them
+# in a subshell where OFFICIAL_* assignments are silently discarded.
+OFFICIAL_TOKEN_VALUE=""
+OFFICIAL_BODY=""
+OFFICIAL_RESULT=""
+
+official_token() {
+    local mode
+    if [ ! -s "$OFFICIAL_TOKEN_FILE" ]; then
+        OFFICIAL_ERROR="token 文件不存在：$OFFICIAL_TOKEN_FILE"
+        return 1
+    fi
+    mode="$(stat -c %a "$OFFICIAL_TOKEN_FILE" 2>/dev/null || printf '')"
+    case "$mode" in
+        600 | 400) ;;
+        *) log "warning: $OFFICIAL_TOKEN_FILE mode is ${mode:-unknown}; chmod 600 recommended" ;;
+    esac
+    OFFICIAL_TOKEN_VALUE="$(tr -d '\r\n' <"$OFFICIAL_TOKEN_FILE" 2>/dev/null)"
+    if [ -z "$OFFICIAL_TOKEN_VALUE" ]; then
+        OFFICIAL_ERROR="token 文件为空"
+        return 1
+    fi
+    return 0
+}
+
+official_get() { # $1 = url; sets OFFICIAL_BODY / OFFICIAL_HTTP_CODE
+    local url="$1" raw
+    official_token || return 1
+    raw="$(curl -sS -m 12 -w $'\n%{http_code}' \
+        -H "Authorization: Bearer $OFFICIAL_TOKEN_VALUE" \
+        -H 'Accept: application/json' \
+        -H 'x-client-platform: web' \
+        -H "Origin: $OFFICIAL_BASE" \
+        -H "Referer: $OFFICIAL_BASE/usage" \
+        --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
+        "$url" 2>>"$CACHE_DIR/official.log")" || {
+        OFFICIAL_HTTP_CODE="000"
+        OFFICIAL_ERROR="请求失败（网络/超时）"
+        return 1
+    }
+    OFFICIAL_HTTP_CODE="${raw##*$'\n'}"
+    OFFICIAL_BODY="${raw%$'\n'*}"
+    case "$OFFICIAL_HTTP_CODE" in
+        200) ;;
+        401 | 403)
+            OFFICIAL_ERROR="官方登录态失效，需要重新获取 userToken"
+            return 1
+            ;;
+        *)
+            OFFICIAL_ERROR="HTTP $OFFICIAL_HTTP_CODE"
+            return 1
+            ;;
+    esac
+    # Application errors arrive with HTTP 200: the envelope is
+    # {code, msg, data:{biz_code, biz_msg, biz_data}} and 40002/40003 mean the
+    # web session token is no longer valid.
+    local app_code app_msg
+    app_code="$(printf '%s' "$OFFICIAL_BODY" | jq -r '((.data.biz_code // empty) // (.code // empty)) // empty' 2>/dev/null)"
+    if [ -n "$app_code" ] && [ "$app_code" != "0" ]; then
+        app_msg="$(printf '%s' "$OFFICIAL_BODY" | jq -r '((.data.biz_msg // empty) // (.msg // empty)) // empty' 2>/dev/null)"
+        case "$app_code" in
+            40002 | 40003)
+                OFFICIAL_ERROR="官方登录态失效（$app_code），需要重新获取 userToken"
+                ;;
+            *)
+                OFFICIAL_ERROR="官方接口错误 $app_code${app_msg:+ · $app_msg}"
+                ;;
+        esac
+        return 1
+    fi
+    return 0
+}
+
+# stdin = amount JSON, $1 = "YYYY-MM" hint for bare day-of-month buckets.
+# Prints {date: {requests, cache_read, input_uncached, output, tokens}}.
+normalize_official() {
+    jq -c --arg month "$1" '
+        def up: (tostring | ascii_upcase);
+        # amounts arrive as strings (e.g. "1234") on this API.
+        def amount_of($v):
+            (if ($v | type) == "string" then ($v | tonumber? // 0)
+             elif ($v | type) == "number" then $v else 0 end);
+        # per-day items: [{model, usage:[{type,amount}]}] or a flat [{type,amount}].
+        def items($d):
+            ((($d.data // $d.models // $d.usage // []) | if type == "array" then . else [] end)
+             | map(.usage // [ . ]) | add // []);
+        .data.biz_data as $biz
+        | (if ($biz | type) == "array" then ($biz[0] // {}) else ($biz // {}) end) as $bd
+        | [ (($bd.days // .days // [])[]
+             | . as $day
+             | (items($day)) as $items
+             | {raw: (($day.date // $day.day // "") | tostring),
+                requests: ([$items[] | select(((.type // "") | up) == "REQUEST") | amount_of(.amount)] | add // 0),
+                cache_read: ([$items[] | select(((.type // "") | up) == "PROMPT_CACHE_HIT_TOKEN") | amount_of(.amount)] | add // 0),
+                input_uncached: ([$items[] | select(((.type // "") | up) == "PROMPT_CACHE_MISS_TOKEN") | amount_of(.amount)] | add // 0),
+                output: ([$items[] | select(((.type // "") | up) == "RESPONSE_TOKEN") | amount_of(.amount)] | add // 0)})
+            | {date: (if (.raw | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}")) then .raw[0:10]
+                      elif ((.raw | test("^[0-9]{1,2}$")) and $month != "")
+                      then ($month + "-" + ((.raw | tonumber) | tostring | if length == 1 then "0" + . else . end))
+                      else "" end),
+               requests: .requests,
+               cache_read: .cache_read,
+               input_uncached: .input_uncached,
+               output: .output} ]
+        | map(select(.date != ""))
+        | map(. as $x | {key: $x.date,
+                         value: {requests: $x.requests, cache_read: $x.cache_read,
+                                 input_uncached: $x.input_uncached, output: $x.output,
+                                 tokens: ($x.cache_read + $x.input_uncached + $x.output)}})
+        | from_entries' 2>/dev/null
+}
+
+# The /cost response has exactly the same shape as /amount — same per-day
+# per-model usage lists — except the numbers are CNY.  Fold the three billed
+# buckets into one per-day total.
+normalize_official_cost() { # stdin = cost JSON, $1 = "YYYY-MM" hint
+    normalize_official "$1" | jq -c '
+        with_entries(.value = (((.value.cache_read + .value.input_uncached + .value.output) * 10000
+                                | round) / 10000))' 2>/dev/null
+}
+
+# Account-level wallet figures: /users/get_user_summary returns
+# {normal_wallets[], bonus_wallets[], total_costs[]} in CNY — total_costs is the
+# all-time cumulative spend, which is exactly what "剩余 / 总额" needs
+# (总额 = 剩余 + 累计消费).
+normalize_official_summary() {
+    jq -c '
+        def amount($arr): ([ ($arr // [])[]
+                             | select((((.currency // "CNY") | tostring | ascii_upcase) == "CNY"))
+                             | ((.balance // .amount // 0) | (if type == "string" then tonumber? // 0 else . end)) ]
+                           | add // 0);
+        .data.biz_data as $bd
+        | (($bd.normal_wallets // []) + ($bd.bonus_wallets // [])) as $wallets
+        | {
+            balance_cny: ((amount($bd.normal_wallets) + amount($bd.bonus_wallets)) * 1000 | round) / 1000,
+            bonus_cny: ((amount($bd.bonus_wallets)) * 1000 | round) / 1000,
+            spent_cny: ((amount($bd.total_costs)) * 1000 | round) / 1000,
+            fetched_at: (now | floor)
+          }' 2>/dev/null
+}
+
+official_months() { # "YYYY-MM" for every month the window touches
+    local offset
+    for offset in $(seq $((OFFICIAL_DAYS - 1)) -1 0); do date -d "-$offset day" +%Y-%m; done | sort -u
+}
+
+fetch_official() { # sets OFFICIAL_RESULT; OFFICIAL_ERROR is set on failure
+    local month_key month year merged_amount="" merged_cost="{}" part
+    official_token || return 1
+
+    # The per-API-key routes reject a web session token (biz_code 1
+    # INVALID_PARAM), so use the monthly routes the usage page itself loads and
+    # ask once per month the window touches.  Amounts/costs are strings.
+    for month_key in $(official_months); do
+        year="${month_key%-*}"
+        month="${month_key#*-}"
+        month="$(printf '%s' "$month" | sed 's/^0//')"
+        [ -n "$month" ] || month=1
+
+        official_get "$OFFICIAL_BASE/api/v0/usage/amount?month=$month&year=$year&tz=$OFFICIAL_TZ" || return 1
+        part="$(printf '%s' "$OFFICIAL_BODY" | normalize_official "$month_key")"
+        if [ -z "$part" ] || [ "$part" = "{}" ] || [ "$part" = "null" ]; then
+            OFFICIAL_ERROR="响应无法解析（$month_key /amount 无每日数据）"
+            return 1
+        fi
+        if [ -z "$merged_amount" ]; then
+            merged_amount="$part"
+        else
+            merged_amount="$(jq -cn --argjson a "$merged_amount" --argjson b "$part" '$a + $b')" || return 1
+        fi
+
+        # Cost is a bonus: without it the day still gets its official token
+        # counts and falls back to the balance delta / estimate for CNY.
+        if official_get "$OFFICIAL_BASE/api/v0/usage/cost?month=$month&year=$year&tz=$OFFICIAL_TZ"; then
+            part="$(printf '%s' "$OFFICIAL_BODY" | normalize_official_cost "$month_key")"
+            [ -n "$part" ] || part="{}"
+            merged_cost="$(jq -cn --argjson a "$merged_cost" --argjson b "$part" '$a + $b')" || merged_cost="{}"
+        else
+            log "official cost fetch failed: $OFFICIAL_ERROR (token data still used)"
+        fi
+    done
+
+    OFFICIAL_RESULT="$(printf '%s' "$merged_amount" | jq -c --argjson costs "$merged_cost" --argjson now "$(date +%s)" '
+        with_entries(.value = (.value + {cost_cny: ($costs[.key] // null), fetched_at: $now}))' 2>/dev/null)"
+    [ -n "$OFFICIAL_RESULT" ] || OFFICIAL_RESULT="$merged_amount"
+    return 0
+}
+
+if [ "$PROBE_OFFICIAL" = 1 ]; then
+    raw=""; raw2=""
+    month_key="$(date +%Y-%m)"
+    year="${month_key%-*}"
+    month="$(printf '%s' "${month_key#*-}" | sed 's/^0//')"
+    [ -n "$month" ] || month=1
+    printf '== token file: %s (mode %s)\n' "$OFFICIAL_TOKEN_FILE" \
+        "$(stat -c %a "$OFFICIAL_TOKEN_FILE" 2>/dev/null || printf missing)"
+    printf '== month %s ==\n' "$month_key"
+    if official_get "$OFFICIAL_BASE/api/v0/usage/amount?month=$month&year=$year&tz=$OFFICIAL_TZ"; then
+        raw="$OFFICIAL_BODY"
+    fi
+    printf '== amount: HTTP %s %s\n' "$OFFICIAL_HTTP_CODE" "$OFFICIAL_ERROR"
+    [ -n "$raw" ] && printf '%s\n' "$(printf '%s' "$raw" | head -c 700)"
+    printf '== 有量的天（normalized）==\n'
+    [ -n "$raw" ] && printf '%s' "$raw" | normalize_official "$month_key" \
+        | jq -c 'to_entries | map(select(.value.tokens > 0))' 2>/dev/null
+    if official_get "$OFFICIAL_BASE/api/v0/usage/cost?month=$month&year=$year&tz=$OFFICIAL_TZ"; then
+        raw2="$OFFICIAL_BODY"
+    fi
+    printf '== cost: HTTP %s %s\n' "$OFFICIAL_HTTP_CODE" "$OFFICIAL_ERROR"
+    printf '== 每日金额（CNY）==\n'
+    [ -n "$raw2" ] && printf '%s' "$raw2" | normalize_official_cost "$month_key" \
+        | jq -c 'to_entries | map(select(.value > 0))' 2>/dev/null
+    exit 0
+fi
+
+OFFICIAL_JSON="$(jq -c 'if type == "object" then . else {} end' "$OFFICIAL_CACHE" 2>/dev/null)" || OFFICIAL_JSON="{}"
+[ -n "$OFFICIAL_JSON" ] || OFFICIAL_JSON="{}"
+OFFICIAL_SUMMARY="$(jq -c 'if type == "object" and has("balance_cny") then . else null end' \
+    "$OFFICIAL_SUMMARY_FILE" 2>/dev/null)" || OFFICIAL_SUMMARY="null"
+[ -n "$OFFICIAL_SUMMARY" ] || OFFICIAL_SUMMARY="null"
+if [ "$OFFICIAL_ENABLED" = "true" ]; then
+    if [ "$OFFLINE" = 0 ] && { [ "$FORCE" = 1 ] || [ "$(cache_age "$OFFICIAL_CACHE")" -ge "$OFFICIAL_TTL" ]; }; then
+        if fetch_official; then
+            OFFICIAL_JSON="$OFFICIAL_RESULT"
+            printf '%s' "$OFFICIAL_JSON" | atomic_write "$OFFICIAL_CACHE"
+            OFFICIAL_STATUS="ready"
+            OFFICIAL_ERROR=""
+            # Wallet totals ride along: 剩余 + 累计消费 = 总额度 for the balance row.
+            if official_get "$OFFICIAL_BASE/api/v0/users/get_user_summary"; then
+                summary="$(printf '%s' "$OFFICIAL_BODY" | normalize_official_summary)"
+                if [ -n "$summary" ] && [ "$summary" != "null" ]; then
+                    printf '%s' "$summary" | atomic_write "$OFFICIAL_SUMMARY_FILE"
+                    OFFICIAL_SUMMARY="$summary"
+                fi
+            else
+                log "official wallet summary fetch failed: $OFFICIAL_ERROR"
+            fi
+        else
+            STALE+=("deepseek-official")
+            if [ "$OFFICIAL_JSON" != "{}" ]; then OFFICIAL_STATUS="stale"; else OFFICIAL_STATUS="error"; fi
+            log "official usage fetch failed: $OFFICIAL_ERROR"
+        fi
+    elif [ "$OFFICIAL_JSON" != "{}" ]; then
+        OFFICIAL_STATUS="ready"
+    else
+        OFFICIAL_STATUS="error"
+        OFFICIAL_ERROR="尚无官方数据"
+    fi
+fi
+
+# ------------------------------------------------------------------ assemble
+STALE_JSON="$(printf '%s\n' ${STALE[@]+"${STALE[@]}"} | jq -R -s 'split("\n") | map(select(length > 0))')"
+SHOW_COST="$(cfg '.ccusage.showCost // true')"
+# track_balance first: it upserts today's row into spend-history.json, which
+# read_history_range then reads back — otherwise today's real spend would only
+# appear on the *next* refresh.
+track_balance
+HISTORY_JSON="$(read_history_range "$HISTORY_DAYS")"
+SPEND_JSON="${TODAY_SPEND:-null}"
+[ -n "$SPEND_JSON" ] || SPEND_JSON="null"
+
+# Last-7-days burn rate for the "balance lasts N days" tile: divide by the
+# window length (idle days count), and prefer real spend per day when known.
+SUMMARY_JSON="$(printf '%s' "$HISTORY_JSON" | jq -c --argjson balance "${BALANCE_CNY:-null}" '
+    def r2: ((. * 100) | round) / 100;
+    .[-7:] as $week
+    | [ $week[] | select(.cost_display_cny != null) ] as $priced
+    | (($priced | map(.cost_display_cny) | add) // 0) as $sum
+    | (if ($week | length) > 0 then ($sum / ($week | length)) else 0 end) as $avg
+    | ([ $priced[] | .cost_source ] | unique) as $sources
+    | {
+        avg_daily_cny: (if ($week | length) > 0 then ($avg | r2) else null end),
+        # one source for every priced day → name it, otherwise it is a blend
+        avg_daily_cny_basis: (if ($priced | length) == 0 then null
+                              elif ($sources | length) == 1 then $sources[0]
+                              else "mixed" end),
+        avg_daily_cny_days: ($priced | length),
+        balance_days_left: (if $balance != null and $avg > 0
+                            then ((($balance / $avg) * 10) | floor) / 10 else null end)
+      }')" || SUMMARY_JSON="{}"
+[ -n "$SUMMARY_JSON" ] || SUMMARY_JSON="{}"
+
+PRICING_JSON="$(jq -nc --argjson hit "$PRICE_HIT" --argjson miss "$PRICE_MISS" --argjson out "$PRICE_OUT" \
+    --argjson peak "$PEAK_MULT" --arg source "$PRICE_SOURCE" \
+    '{currency: "CNY", off_peak: {cache_hit: $hit, cache_miss: $miss, output: $out},
+      peak_multiplier: $peak, source: $source}')"
+OFFICIAL_JSON_STATUS="$(printf '%s' "$OFFICIAL_JSON" | jq -c \
+    --arg status "$OFFICIAL_STATUS" --arg error "$OFFICIAL_ERROR" \
+    --argjson enabled "$([ "$OFFICIAL_ENABLED" = "true" ] && printf true || printf false)" '
+    {enabled: $enabled, status: $status, error: $error, days: (length), currency: "CNY"}')" \
+    || OFFICIAL_JSON_STATUS='{"enabled":false,"status":"error","error":"","days":0,"currency":"CNY"}'
+
+OUT="$(jq -n \
+    --argjson now "$(date +%s)" \
+    --argjson providers "$PROVIDERS_JSON" \
+    --argjson local "$LOCAL_JSON" \
+    --argjson history "$HISTORY_JSON" \
+    --argjson summary "$SUMMARY_JSON" \
+    --argjson pricing "$PRICING_JSON" \
+    --argjson officialStatus "$OFFICIAL_JSON_STATUS" \
+    --argjson wallet "$OFFICIAL_SUMMARY" \
+    --arg balanceProvider "$BALANCE_PROVIDER" \
+    --argjson balance "${BALANCE_CNY:-null}" \
+    --arg todayStr "$(date +%F)" \
+    --argjson spend "$SPEND_JSON" \
+    --argjson topup "$SPEND_TOPUP" \
+    --argjson stale "$STALE_JSON" \
+    --arg error "$ERROR_MSG" \
+    --argjson showCost "$([ "$SHOW_COST" = "true" ] && printf true || printf false)" '
+    def fmt($s):
+        if $s >= 86400 then ((($s / 86400) | floor) | tostring) + "d" + (((($s % 86400) / 3600) | floor) | tostring) + "h"
+        elif $s >= 3600 then ((($s / 3600) | floor) | tostring) + "h" + (((($s % 3600) / 60) | floor) | tostring) + "m"
+        elif $s >= 60 then ((($s / 60) | floor) | tostring) + "m"
+        else (($s | floor) | tostring) + "s" end;
+    def money2:
+        ((. * 100) | round) / 100
+        | tostring
+        | if test("\\.[0-9]$") then . + "0" elif test("\\.") then . else . + ".00" end;
+    # 剩余 / 总额：总额 = 剩余余额 + 官方累计消费（total_costs）
+    def walletTotal:
+        if ($wallet != null) and (($wallet.spent_cny // null) != null) and ($balance != null)
+        then ($balance + $wallet.spent_cny) else null end;
+    {
+        schema_version: 1,
+        generated_at: $now,
+        error: $error,
+        stale_sources: $stale,
+        providers: ($providers | map(
+            .reset_text = (if ((.reset_at // 0) > $now) then (fmt(.reset_at - $now)) + " 后" else "" end)
+            # Balance providers show "剩余/总额" once the official wallet
+            # summary is available; otherwise the plain balance stays.
+            | if (.id == $balanceProvider) and (walletTotal != null) then
+                  .display = ("¥" + ($balance | money2) + "/¥" + (walletTotal | money2))
+              else . end)),
+        local: ($local + {
+            show_cost: $showCost,
+            history: $history,
+            history_window_days: ($history | length),
+            history_active_days: ([$history[] | select((.tokens // 0) > 0)] | length),
+            today: ([$history[] | select(.date == $todayStr)] | last // null),
+            today_spend_cny: $spend,
+            spend_topup: $topup,
+            balance_cny: $balance,
+            avg_daily_cny: ($summary.avg_daily_cny // null),
+            avg_daily_cny_basis: ($summary.avg_daily_cny_basis // null),
+            avg_daily_cny_days: ($summary.avg_daily_cny_days // 0),
+            balance_days_left: ($summary.balance_days_left // null),
+            pricing: $pricing,
+            official: $officialStatus,
+            # 余额（剩余 / 累计消费 / 总额度），来自官方钱包接口；拿不到时为 null
+            wallet: (if walletTotal != null then
+                         {remaining_cny: $balance, spent_cny: $wallet.spent_cny,
+                          total_cny: walletTotal, source: "official"}
+                     else null end)
+        })
+    }')" || OUT="$(emergency_json)"
+
+printf '%s\n' "$OUT" | atomic_write "$LAST_GOOD"
+printf '%s\n' "$OUT"
+exit 0

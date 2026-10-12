@@ -1,0 +1,40 @@
+{
+  "deepseekApiKey": "sk-REPLACE_ME",
+  "deepseekApiKeyFromClaudeSettings": false,
+  "balanceProvider": "deepseek",
+  "providers": {
+    "zaiApiKey": "",
+    "kimiApiKey": "",
+    "openrouterApiKey": ""
+  },
+  "aiUsagebar": {
+    "path": ""
+  },
+  "ccusage": {
+    "path": "",
+    "enabled": true,
+    "showCost": true
+  },
+  "historyWindowDays": 30,
+  "pricing": {
+    "offPeak": {
+      "cacheHit": 0.02,
+      "cacheMiss": 1,
+      "output": 4
+    },
+    "peakMultiplier": 2
+  },
+  "relay": {
+    "enabled": false,
+    "baseUrl": "",
+    "apiKey": ""
+  },
+  "official": {
+    "enabled": false,
+    "baseUrl": "https://platform.deepseek.com",
+    "tokenFile": "",
+    "ttlSeconds": 3600,
+    "tz": 28800,
+    "days": 30
+  }
+}
