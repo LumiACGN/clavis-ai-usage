@@ -17,13 +17,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 校验 tag == manifest 版本 & CHANGELOG
+      - name: 校验 tag == manifest 版本 & CHANGELOG & PKGBUILD
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/v}"
           ver=$(jq -r '.tool_version' patches/manifest.json)
           [ "$tag" = "$ver" ] || { echo "tag($tag) != manifest tool_version($ver)"; exit 1; }
           grep -q "\[$tag\]" CHANGELOG.md || { echo "CHANGELOG.md 缺少 [$tag] 小节"; exit 1; }
+          grep -q "^pkgver=$tag$" packaging/aur/clavis-ai-usage/PKGBUILD \
+            || { echo "PKGBUILD pkgver 与 tag($tag) 不一致"; exit 1; }
 
       - name: 打包与校验和
         run: |
